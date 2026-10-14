@@ -1,6 +1,7 @@
 import { N, DX, EXT, PRESETS, generate, roughen, brush, raycast, sampleZ, encodeBeach, decodeBeach } from './terrain.js';
 import { createRenderer } from './render.js';
 import { solve, swellSpectrum } from './waves.js';
+import { loadEngine, createEngine } from './engine-driver.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('view');
@@ -14,6 +15,7 @@ let paused = false;
 let speed = 1;
 let last = null; // last solver result
 const undoStack = [];
+let engine = null, engineMods = null, engineAuto = false;
 
 const store = {
   get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
@@ -45,6 +47,7 @@ function onSolved(res) {
   busy = false;
   last = res;
   R.setWaves(res);
+  if (engine) engine.setTargets(res, swell);
   updateVerdict(res.summary);
   if (pending) requestSolve(); else statusEl.hidden = true;
 }
@@ -96,11 +99,16 @@ function updateVerdict(s) {
 }
 
 // --- beach -----------------------------------------------------------------------
+function heightChanged() {
+  R.setHeight(beach);
+  if (engine) engine.setBeach(beach, beach.waterLevel);
+}
 function setBeach(b, keepWl) {
   beach.z = b.z; beach.rock = b.rock;
   if (!keepWl && b.waterLevel !== undefined) { beach.waterLevel = b.waterLevel; $('tide').value = b.waterLevel; }
   readTide();
-  R.setHeight(beach);
+  heightChanged();
+  if (engine) engine.reset();
   R.resetFoam();
   requestSolve();
   autosave();
@@ -110,6 +118,7 @@ function readTide() {
   const v = beach.waterLevel;
   $('o-tide').value = `${v > 0 ? '+' : ''}${v.toFixed(2)} m`;
   R.setWaterLevel(v);
+  if (engine) engine.setWaterLevel(v);
 }
 $('tide').addEventListener('input', () => {
   readTide();
@@ -127,7 +136,7 @@ function undo() {
   const s = undoStack.pop();
   if (!s) return;
   beach.z = s.z; beach.rock = s.rock;
-  R.setHeight(beach);
+  heightChanged();
   requestSolve();
   autosave();
   $('undo').disabled = undoStack.length === 0;
@@ -136,7 +145,7 @@ $('undo').addEventListener('click', undo);
 $('roughen').addEventListener('click', () => {
   pushUndo();
   roughen(beach, 0.6, (Math.random() * 1e5) | 0);
-  R.setHeight(beach);
+  heightChanged();
   requestSolve();
   autosave();
 });
@@ -379,14 +388,62 @@ function loop(t) {
   prevT = t;
   if (painting && paintPt) {
     brush(beach, tool, paintPt[0], paintPt[1], +radiusIn.value, +strengthIn.value, dt, flatTarget);
-    R.setHeight(beach);
+    heightChanged();
     R.setBrush(paintPt[0], paintPt[1], +radiusIn.value, true);
     if (t - lastSolveReq > 350) { lastSolveReq = t; requestSolve(); }
   }
   if (++probeTick % 4 === 0) updateProbe();
+  if (engine && engineAuto && last) pickTier();
   R.frame(paused ? 0 : dt * speed);
   requestAnimationFrame(loop);
 }
+
+// --- real-fluid engine -------------------------------------------------------------------
+// The engine runs the GPU Boussinesq solver (src/engine), the crest readback
+// and the breakers (src/breakers). "auto" measures the GPU once and picks the
+// finest resolution it can run at full speed; "classic" is the old linear
+// wave model.
+const coarsePointer = matchMedia('(pointer: coarse)').matches;
+function engineLabel() {
+  if (!engine) return engineMods ? 'Classic' : 'Classic (engine unavailable)';
+  return `Real fluid · ${engine.layout.dxs} m cells`;
+}
+function startEngine(r) {
+  if (engine) { R.setEngine(null); engine.dispose(); engine = null; }
+  try {
+    engine = createEngine(R.renderer, engineMods, { r, maxStepsPerFrame: r > 1 ? 6 : 8 });
+    engine.setBeach(beach, beach.waterLevel);
+    if (last) engine.setTargets(last, swell);
+    R.setEngine(engine);
+    R.resetFoam();
+  } catch (e) {
+    console.warn('Real-fluid engine failed to start; using the classic waves.', e);
+    engine = null;
+    R.setEngine(null);
+  }
+  $('s-engine').textContent = engineLabel();
+}
+// Auto tier: try the fine grid first and keep it if a step is quick enough
+// to leave most of the frame for rendering.
+function pickTier() {
+  engineAuto = false;
+  const ms = engine.probe();
+  const budget = engine.r > 1 ? 4.5 : 9;
+  if (ms > budget && engine.r > 1) startEngine(1);
+  else if (ms > budget * 2 && engine.r === 1) { R.setEngine(null); engine.dispose(); engine = null; $('s-engine').textContent = 'Classic (GPU too slow)'; }
+  console.info(`engine probe: ${ms.toFixed(2)} ms/step at ${engine ? engine.layout.dxs : '-'} m`);
+}
+async function bootEngine() {
+  const mode = $('engine').value;
+  if (mode === 'classic') { if (engine) { R.setEngine(null); engine.dispose(); engine = null; } $('s-engine').textContent = engineLabel(); return; }
+  if (!R.renderer.capabilities.isWebGL2) { $('s-engine').textContent = 'Classic (needs WebGL2)'; return; }
+  if (!engineMods) {
+    try { engineMods = await loadEngine(); } catch (e) { console.warn('Real-fluid engine unavailable', e); $('s-engine').textContent = 'Classic (engine unavailable)'; return; }
+  }
+  if (mode === 'auto') { engineAuto = true; startEngine(coarsePointer ? 1 : 2); }
+  else startEngine(mode === 'fine' ? 2 : 1);
+}
+$('engine').addEventListener('change', () => { store.set('shorebreak.engine', $('engine').value); bootEngine(); });
 
 // --- boot ---------------------------------------------------------------------------------
 const savedSwell = store.get('shorebreak.swell');
@@ -403,5 +460,8 @@ renderSaved();
 let start = null;
 try { const cur = store.get('shorebreak.current'); if (cur) start = decodeBeach(cur); } catch { start = null; }
 setBeach(start || { ...generate({ ...PRESETS.crescent, seed: 7 }), waterLevel: 0 });
+const savedEngine = store.get('shorebreak.engine');
+if (savedEngine) $('engine').value = savedEngine;
+bootEngine();
 requestAnimationFrame(loop);
-window.__app = { beach, swell, R, setTool, requestSolve, viewInfo, preset: (k) => setBeach({ ...generate({ ...PRESETS[k], seed: 7 }), waterLevel: 0 }), get last() { return last; } };
+window.__app = { beach, swell, R, setTool, requestSolve, viewInfo, preset: (k) => setBeach({ ...generate({ ...PRESETS[k], seed: 7 }), waterLevel: 0 }), get last() { return last; }, get engine() { return engine; }, startEngine };

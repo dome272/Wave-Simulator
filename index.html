@@ -196,6 +196,13 @@ dialog::backdrop { background: rgba(8, 24, 30, 0.45); }
       <label class="toggle"><input type="checkbox" id="contours"> Depth contours (1 m)</label>
       <label class="toggle"><input type="checkbox" id="xray"> See-through water</label>
     </section>
+    <section aria-labelledby="h-engine">
+      <h2 id="h-engine">Wave engine</h2>
+      <div class="field"><label for="engine">Quality</label><span></span>
+        <select id="engine"><option value="auto">Auto (measure this GPU)</option><option value="fine">Real fluid · fine (1.25 m)</option><option value="standard">Real fluid · standard (2.5 m)</option><option value="classic">Classic (linear waves)</option></select></div>
+      <div class="stats"><div class="stat"><small>Running</small><b id="s-engine">–</b></div></div>
+      <p class="hint">Real fluid solves the water motion itself (a Boussinesq model), so waves shoal, pitch and break where the seabed makes them. Fine cells resolve smaller waves but cost four times more.</p>
+    </section>
   </div>
 </aside>
 

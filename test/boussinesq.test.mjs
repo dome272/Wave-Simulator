@@ -157,5 +157,50 @@ const hasNaN = (a) => { for (let i = 0; i < a.length; i++) if (!Number.isFinite(
   check('dam break on dry bed matches Ritter within 10%', Math.abs(front - frontRitter) / (frontRitter - 100) < 0.10 && Math.abs(hDam - 4 / 9 * h0) < 0.03);
 }
 
+// 8. Oblique swell over a plane slope refracts by Snell's law (checks the
+//    two-dimensional terms: fluxes, cross derivatives and the y operator).
+{
+  const dx = 2.5, nx = 64, ny = 152;
+  const d0 = 8, flat = 100, slope = 1 / 30, H = 0.6, T = 10;
+  const bed = corners(nx, ny, dx, (x, y) => (y < flat ? -d0 : -d0 + (y - flat) * slope));
+  const relax = relaxField(nx, ny, { offshore: 24 });
+  const w = 2 * Math.PI / T, k0 = wavenumberMS(w, d0), kx = 2 * Math.PI / (nx * dx), ky0 = Math.sqrt(k0 * k0 - kx * kx), c0 = w / k0;
+  const target = (t, etaT, PT, QT) => {
+    const ramp = Math.min(1, t / (2 * T));
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const cc = j * nx + i, x = (i + 0.5) * dx, y = (j + 0.5) * dx;
+      const e = ramp * 0.5 * H * Math.cos(kx * x + ky0 * y - w * t);
+      etaT[cc] = e; PT[cc] = c0 * e * kx / k0; QT[cc] = c0 * e * ky0 / k0;
+    }
+  };
+  const s = createSolver({ nx, ny, dx, bed, wl: 0, periodicX: true, relax, target, manning: 0.02 });
+  const dt = 0.25 * dx / Math.sqrt(G * d0 * 1.3);
+  const nT = 12, tEnd = nT * T;
+  const re = new Float64Array(nx * ny), im = new Float64Array(nx * ny);
+  const e = new Float64Array(nx * ny);
+  let t = 0;
+  while (t < tEnd - 1e-9) {
+    s.step(dt); t += dt;
+    if (t > (nT - 3) * T) { s.eta(e); const cw = Math.cos(w * t), sw = Math.sin(w * t); for (let c = 0; c < nx * ny; c++) { re[c] += e[c] * cw; im[c] += e[c] * sw; } }
+  }
+  const wrap = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+  const at = (depth) => {
+    const j = Math.round((flat + (d0 - depth) / slope) / dx);
+    let dphx = 0, dphy = 0;
+    for (let i = 0; i < nx; i++) {
+      const c = j * nx + i, cr = j * nx + (i + 1) % nx, cn = (j + 1) * nx + i;
+      const ph = (q) => Math.atan2(im[q], re[q]);
+      dphx += wrap(ph(cr) - ph(c)); dphy += wrap(ph(cn) - ph(c));
+    }
+    const kxm = -dphx / (nx * dx), kym = -dphy / (nx * dx);
+    const kMS = wavenumberMS(w, depth);
+    return { k: Math.hypot(kxm, kym), kMS, ang: Math.atan2(Math.abs(kxm), Math.abs(kym)), snell: Math.asin(Math.min(1, kx / kMS)) };
+  };
+  const r4 = at(4), r3 = at(3);
+  const deg = (a) => (a * 180 / Math.PI).toFixed(1);
+  console.log(`   refraction: offshore ${deg(Math.asin(kx / k0))} deg; at 4 m ${deg(r4.ang)} deg (Snell ${deg(r4.snell)}), k ${r4.k.toFixed(4)} (MS ${r4.kMS.toFixed(4)}); at 3 m ${deg(r3.ang)} deg (Snell ${deg(r3.snell)})`);
+  check('oblique swell refracts by Snell\'s law within 1 degree and 1.5% in wavenumber', Math.abs(r4.ang - r4.snell) < Math.PI / 180 && Math.abs(r3.ang - r3.snell) < Math.PI / 180 && Math.abs(r4.k / r4.kMS - 1) < 0.015);
+}
+
 console.log(failures ? `\n${failures} test(s) failed` : '\nall tests passed');
 process.exit(failures ? 1 : 0);
