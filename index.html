@@ -1,0 +1,260 @@
+<title>Shorebreak Lab</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: full-bleed 3D diorama; a control rail on the left, sculpt tools docked bottom-centre. */
+:root {
+  --ink: #0e2a36;
+  --ink-soft: #4a6470;
+  --panel: rgba(250, 247, 240, 0.92);
+  --panel-solid: #faf7f0;
+  --line: rgba(14, 42, 54, 0.12);
+  --sea: #13808a;
+  --sea-strong: #0b6670;
+  --on-sea: #ffffff;
+  --sand: #e7d9bb;
+  --chip: rgba(19, 128, 138, 0.10);
+  --sky-top: #9fc4dc;
+  --sky-bottom: #e8eef0;
+  --warn: #b5541c;
+  --shadow: 0 10px 30px rgba(14, 42, 54, 0.16);
+  --f-display: "Barlow Semi Condensed", "Arial Narrow", system-ui, sans-serif;
+  --f-body: "Barlow", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-data: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ink: #e4eef0; --ink-soft: #93acb4; --panel: rgba(13, 29, 38, 0.90); --panel-solid: #0d1d26;
+    --line: rgba(228, 238, 240, 0.12); --sea: #3fb7bd; --sea-strong: #63cdd1; --on-sea: #062026;
+    --sand: #3a3428; --chip: rgba(63, 183, 189, 0.14); --sky-top: #0b1a26; --sky-bottom: #24404c;
+    --warn: #f0965c; --shadow: 0 10px 30px rgba(0, 0, 0, 0.45); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --ink: #e4eef0; --ink-soft: #93acb4; --panel: rgba(13, 29, 38, 0.90); --panel-solid: #0d1d26;
+  --line: rgba(228, 238, 240, 0.12); --sea: #3fb7bd; --sea-strong: #63cdd1; --on-sea: #062026;
+  --sand: #3a3428; --chip: rgba(63, 183, 189, 0.14); --sky-top: #0b1a26; --sky-bottom: #24404c;
+  --warn: #f0965c; --shadow: 0 10px 30px rgba(0, 0, 0, 0.45); color-scheme: dark;
+}
+html, body { height: 100%; }
+body {
+  margin: 0; overflow: hidden; font-family: var(--f-body); font-size: 14px; color: var(--ink);
+  background: linear-gradient(180deg, var(--sky-top), var(--sky-bottom));
+}
+#view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; outline: none; }
+#view.sculpt { cursor: crosshair; }
+
+.rail {
+  position: fixed; top: calc(12px + env(safe-area-inset-top, 0px)); left: max(12px, env(safe-area-inset-left, 0px));
+  bottom: calc(84px + env(safe-area-inset-bottom, 0px)); width: 296px; display: flex; flex-direction: column;
+  background: var(--panel); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; z-index: 5;
+}
+.rail header { padding: 14px 16px 10px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.brand { font-family: var(--f-display); font-weight: 700; font-size: 21px; letter-spacing: 0.01em; margin: 0; }
+.brand span { color: var(--sea); }
+.scroll { overflow-y: auto; padding: 4px 16px 16px; display: flex; flex-direction: column; gap: 4px; }
+section { display: flex; flex-direction: column; gap: 10px; padding-block: 12px; border-bottom: 1px solid var(--line); }
+section:last-child { border-bottom: 0; }
+h2 { font-family: var(--f-display); font-weight: 600; font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--ink-soft); margin: 0; }
+.field { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; align-items: baseline; }
+.field label { font-weight: 500; }
+.field output { font-family: var(--f-data); font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--sea-strong); }
+.field input[type=range] { grid-column: 1 / -1; }
+.hint { font-size: 12px; color: var(--ink-soft); line-height: 1.4; margin: 0; }
+input[type=range] { width: 100%; accent-color: var(--sea); margin: 2px 0 0; height: 22px; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.stat { background: var(--chip); border-radius: 8px; padding: 6px 8px; display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.stat b { font-family: var(--f-data); font-weight: 500; font-size: 13px; font-variant-numeric: tabular-nums; }
+.stat small { font-size: 10.5px; color: var(--ink-soft); letter-spacing: 0.04em; text-transform: uppercase; }
+.verdict { font-size: 13.5px; line-height: 1.45; margin: 0; }
+.verdict strong { font-family: var(--f-display); font-weight: 700; font-size: 15px; color: var(--sea-strong); }
+.row { display: flex; flex-wrap: wrap; gap: 6px; }
+button {
+  font: 500 13px var(--f-body); color: var(--ink); background: transparent; border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 10px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+}
+button:hover { border-color: var(--sea); }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--sea); outline-offset: 2px; }
+button.primary { background: var(--sea); border-color: var(--sea); color: var(--on-sea); font-weight: 600; }
+button.primary:hover { background: var(--sea-strong); }
+button[aria-pressed="true"] { background: var(--chip); border-color: var(--sea); color: var(--sea-strong); }
+button:disabled { opacity: 0.45; cursor: default; }
+.toggle { display: flex; align-items: center; gap: 8px; font-weight: 500; cursor: pointer; }
+.toggle input { accent-color: var(--sea); width: 16px; height: 16px; }
+select, input[type=number] {
+  font: 500 13px var(--f-body); color: var(--ink); background: var(--panel-solid); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px;
+}
+.saved { display: flex; flex-direction: column; gap: 4px; }
+.saved .item { display: flex; gap: 6px; align-items: center; }
+.saved .item button:first-child { flex: 1; justify-content: flex-start; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.dock {
+  position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+  display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: var(--panel); backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow); z-index: 6;
+  max-width: calc(100% - 24px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
+}
+.tools { display: flex; gap: 4px; }
+.tool { flex-direction: column; gap: 2px; padding: 6px 9px; font-size: 11.5px; min-width: 52px; justify-content: center; }
+.tool svg { width: 20px; height: 20px; }
+.brushset { display: flex; flex-direction: column; gap: 2px; width: 150px; }
+.brushset .field label { font-size: 12px; }
+.sep { width: 1px; align-self: stretch; background: var(--line); }
+
+.hud {
+  position: fixed; top: calc(12px + env(safe-area-inset-top, 0px)); right: max(12px, env(safe-area-inset-right, 0px));
+  display: flex; gap: 6px; z-index: 4; flex-wrap: wrap; justify-content: flex-end;
+}
+.hud button { background: var(--panel); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+.probe {
+  position: fixed; pointer-events: none; z-index: 7; background: var(--panel-solid); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 9px; font: 12px var(--f-data); font-variant-numeric: tabular-nums; box-shadow: var(--shadow);
+  white-space: nowrap; transform: translate(14px, 14px);
+}
+.status {
+  position: fixed; left: 50%; transform: translateX(-50%); top: calc(14px + env(safe-area-inset-top, 0px));
+  background: var(--panel-solid); border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px;
+  font-size: 12px; color: var(--ink-soft); z-index: 4; box-shadow: var(--shadow);
+}
+.menu-btn { display: none; }
+
+dialog {
+  border: 1px solid var(--line); border-radius: 16px; padding: 0; background: var(--panel-solid); color: var(--ink);
+  width: min(620px, calc(100% - 32px)); box-shadow: var(--shadow); max-height: calc(100% - 40px);
+}
+dialog::backdrop { background: rgba(8, 24, 30, 0.45); }
+.dlg { display: flex; flex-direction: column; gap: 16px; padding: 20px; }
+.dlg h3 { font-family: var(--f-display); font-size: 24px; font-weight: 700; margin: 0; text-wrap: balance; }
+.presets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.preset { flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; padding: 10px; min-width: 0; }
+.preset b { font-family: var(--f-display); font-size: 15px; font-weight: 600; }
+.preset span { font-size: 12px; color: var(--ink-soft); line-height: 1.3; }
+.opts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 20px; }
+.opts .field select, .opts .field .seed { grid-column: 1 / -1; }
+.seed { display: flex; gap: 6px; }
+.seed input { flex: 1; min-width: 0; }
+.actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+@media (max-width: 720px) {
+  .rail { width: auto; right: max(12px, env(safe-area-inset-right, 0px)); bottom: calc(150px + env(safe-area-inset-bottom, 0px)); top: calc(60px + env(safe-area-inset-top, 0px)); display: none; }
+  .rail.open { display: flex; }
+  .hud [data-view="shore"], .hud [data-view="top"] { display: none; }
+  .hud { left: max(12px, env(safe-area-inset-left, 0px)); justify-content: flex-start; }
+  .menu-btn { display: inline-flex; }
+  .dock { flex-wrap: wrap; justify-content: center; width: calc(100% - 24px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)); }
+  .brushset { width: auto; flex: 1; min-width: 120px; }
+  .tool { min-width: 0; padding: 6px 7px; }
+  .dock .sep { display: none; }
+  .presets { grid-template-columns: 1fr 1fr; }
+  .opts { grid-template-columns: 1fr; }
+  .status { top: auto; bottom: calc(160px + env(safe-area-inset-bottom, 0px)); }
+}
+</style>
+
+<canvas id="view" tabindex="0" aria-label="3D beach and waves. Drag to look around, or pick a sand tool to reshape the beach."></canvas>
+
+<aside class="rail" id="rail">
+  <header>
+    <h1 class="brand">Shorebreak <span>Lab</span></h1>
+    <button id="newBeach" class="primary" title="Build a new beach">+ New beach</button>
+  </header>
+  <div class="scroll">
+    <section aria-labelledby="h-swell">
+      <h2 id="h-swell">Incoming swell</h2>
+      <div class="field"><label for="height">Wave height</label><output id="o-height"></output><input id="height" type="range" min="0.3" max="6" step="0.1" value="1.8"></div>
+      <div class="field"><label for="period">Period</label><output id="o-period"></output><input id="period" type="range" min="5" max="20" step="0.5" value="13"></div>
+      <div class="field"><label for="direction">Direction</label><output id="o-direction"></output><input id="direction" type="range" min="-60" max="60" step="1" value="15"></div>
+      <div class="field"><label for="distance">Storm distance</label><output id="o-distance"></output><input id="distance" type="range" min="0" max="1" step="0.005" value="0.8"></div>
+      <p class="hint">Height is the swell as it arrives offshore. A distant storm sends clean lines with long gaps between sets; a nearby one sends a jumbled, choppy sea.</p>
+      <div class="stats">
+        <div class="stat"><small>Wavelength</small><b id="s-len">–</b></div>
+        <div class="stat"><small>Speed</small><b id="s-speed">–</b></div>
+        <div class="stat"><small>Set</small><b id="s-set">–</b></div>
+      </div>
+    </section>
+    <section aria-labelledby="h-break">
+      <h2 id="h-break">How it breaks</h2>
+      <p class="verdict" id="verdict">Working out the waves…</p>
+    </section>
+    <section aria-labelledby="h-beach">
+      <h2 id="h-beach">Beach</h2>
+      <div class="field"><label for="tide">Water level (tide)</label><output id="o-tide"></output><input id="tide" type="range" min="-1.5" max="1.5" step="0.05" value="0"></div>
+      <div class="row">
+        <button id="roughen" title="Add natural bumps and ripples to the whole beach">Add randomness</button>
+        <button id="undo" title="Undo (Ctrl+Z)" disabled>Undo</button>
+      </div>
+      <div class="row"><button id="save">Save this beach</button></div>
+      <div class="saved" id="savedList"></div>
+    </section>
+    <section aria-labelledby="h-display">
+      <h2 id="h-display">Display</h2>
+      <div class="field"><label for="speed">Playback speed</label><output id="o-speed"></output><input id="speed" type="range" min="0.25" max="4" step="0.25" value="1"></div>
+      <label class="toggle"><input type="checkbox" id="contours"> Depth contours (1 m)</label>
+      <label class="toggle"><input type="checkbox" id="xray"> See-through water</label>
+    </section>
+  </div>
+</aside>
+
+<div class="hud">
+  <button class="menu-btn" id="menuBtn" aria-controls="rail" aria-expanded="false">Controls</button>
+  <button id="pause" aria-pressed="false">Pause</button>
+  <button data-view="overview">Overview</button>
+  <button data-view="lineup">Lineup</button>
+  <button data-view="shore">Beach</button>
+  <button data-view="top">Top down</button>
+</div>
+
+<div class="status" id="status" hidden>Recomputing waves…</div>
+<div class="probe" id="probe" hidden></div>
+
+<div class="dock" role="toolbar" aria-label="Beach tools">
+  <div class="tools" id="tools">
+    <button class="tool" data-tool="view" aria-pressed="true" title="Look around (1)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="2.6"/></svg>Look</button>
+    <button class="tool" data-tool="sand" title="Pile up sand: click and drag (2)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M5 9h14l-1.6 10.2a1.5 1.5 0 0 1-1.5 1.3H8.1a1.5 1.5 0 0 1-1.5-1.3z"/><path d="M8 9a4 4 0 0 1 8 0"/><path d="M9 14c1 .6 2 .6 3 0s2-.6 3 0"/></svg>Sand</button>
+    <button class="tool" data-tool="dig" title="Dig sand away (3)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3l7 7"/><path d="M17.5 6.5L9 15"/><path d="M9 15l-4.5 1.5a1.5 1.5 0 0 0-.6 2.5l1.1 1.1a1.5 1.5 0 0 0 2.5-.6L9 15z"/></svg>Dig</button>
+    <button class="tool" data-tool="smooth" title="Smooth bumps (4)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 15c3-4 5-4 9 0s6 4 9 0"/><path d="M3 9c3-2 5-2 9 0s6 2 9 0" opacity=".5"/></svg>Smooth</button>
+    <button class="tool" data-tool="flatten" title="Flatten to the height where you start (5)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 14h18"/><path d="M6 10l3 4M12 9v5M18 10l-3 4"/></svg>Flatten</button>
+    <button class="tool" data-tool="rock" title="Lay down rock and reef (6)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 19l4-8 4 3 3-6 7 11z"/></svg>Rock</button>
+  </div>
+  <div class="sep"></div>
+  <div class="brushset">
+    <div class="field"><label for="radius">Brush</label><output id="o-radius"></output><input id="radius" type="range" min="5" max="80" step="1" value="25"></div>
+    <div class="field"><label for="strength">Strength</label><output id="o-strength"></output><input id="strength" type="range" min="0.1" max="2" step="0.05" value="0.8"></div>
+  </div>
+</div>
+
+<dialog id="dlg" aria-labelledby="dlg-title">
+  <form method="dialog" class="dlg" id="dlgForm">
+    <h3 id="dlg-title">Build a beach</h3>
+    <div class="presets" id="presets"></div>
+    <div class="opts">
+      <div class="field"><label for="b-shape">Coastline</label><span></span>
+        <select id="b-shape"><option value="straight">Straight beach</option><option value="cove">Cove between headlands</option><option value="point">Point with a rocky headland</option><option value="reef">Reef peak</option></select></div>
+      <div class="field"><label for="b-bar">Sandbars</label><span></span>
+        <select id="b-bar"><option value="none">None</option><option value="straight">One long bar</option><option value="rhythmic">Crescents with rip channels</option></select></div>
+      <div class="field"><label for="b-slope">Steepness</label><output id="o-b-slope"></output><input id="b-slope" type="range" min="0" max="1" step="0.05"></div>
+      <div class="field"><label for="b-barDist">Bar distance from shore</label><output id="o-b-barDist"></output><input id="b-barDist" type="range" min="50" max="260" step="5"></div>
+      <div class="field"><label for="b-rocks">Rocks</label><output id="o-b-rocks"></output><input id="b-rocks" type="range" min="0" max="1" step="0.05"></div>
+      <div class="field"><label for="b-roughness">Randomness</label><output id="o-b-roughness"></output><input id="b-roughness" type="range" min="0" max="1" step="0.05"></div>
+      <div class="field"><label for="b-seed">Variation</label><span></span>
+        <div class="seed"><input id="b-seed" type="number" min="0" max="99999" step="1"><button type="button" id="b-dice" title="Pick a random variation">Shuffle</button></div></div>
+    </div>
+    <p class="hint">Randomness roughens the seabed the way real beaches are uneven. Each variation number gives a different version of the same design.</p>
+    <div class="actions">
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button value="build" class="primary" id="b-build">Build beach</button>
+    </div>
+  </form>
+</dialog>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module" src="src/app.js"></script>
