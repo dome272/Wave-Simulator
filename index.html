@@ -142,7 +142,7 @@ dialog::backdrop { background: rgba(8, 24, 30, 0.45); }
 @media (max-width: 720px) {
   .rail { width: auto; right: max(12px, env(safe-area-inset-right, 0px)); bottom: calc(150px + env(safe-area-inset-bottom, 0px)); top: calc(60px + env(safe-area-inset-top, 0px)); display: none; }
   .rail.open { display: flex; }
-  .hud [data-view="shore"], .hud [data-view="top"] { display: none; }
+  .hud [data-view="lineup"], .hud [data-view="top"] { display: none; }
   .hud { left: max(12px, env(safe-area-inset-left, 0px)); justify-content: flex-start; }
   .menu-btn { display: inline-flex; }
   .dock { flex-wrap: wrap; justify-content: center; width: calc(100% - 24px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)); }
@@ -169,11 +169,11 @@ dialog::backdrop { background: rgba(8, 24, 30, 0.45); }
       <div class="field"><label for="period">Period</label><output id="o-period"></output><input id="period" type="range" min="5" max="20" step="0.5" value="13"></div>
       <div class="field"><label for="direction">Direction</label><output id="o-direction"></output><input id="direction" type="range" min="-60" max="60" step="1" value="15"></div>
       <div class="field"><label for="distance">Storm distance</label><output id="o-distance"></output><input id="distance" type="range" min="0" max="1" step="0.005" value="0.8"></div>
-      <p class="hint">Height is the swell as it arrives offshore. A distant storm sends clean lines with long gaps between sets; a nearby one sends a jumbled, choppy sea.</p>
+      <p class="hint">Height is the typical wave as it arrives offshore; set waves run about a third bigger. A distant storm sends clean lines with long gaps between sets; a nearby one sends a jumbled, choppy sea.</p>
       <div class="stats">
         <div class="stat"><small>Wavelength</small><b id="s-len">–</b></div>
         <div class="stat"><small>Speed</small><b id="s-speed">–</b></div>
-        <div class="stat"><small>Set</small><b id="s-set">–</b></div>
+        <div class="stat"><small>Sets</small><b id="s-set">–</b></div>
       </div>
     </section>
     <section aria-labelledby="h-break">
@@ -204,6 +204,7 @@ dialog::backdrop { background: rgba(8, 24, 30, 0.45); }
   <button id="pause" aria-pressed="false">Pause</button>
   <button data-view="overview">Overview</button>
   <button data-view="lineup">Lineup</button>
+  <button data-view="impact">Impact</button>
   <button data-view="shore">Beach</button>
   <button data-view="top">Top down</button>
 </div>

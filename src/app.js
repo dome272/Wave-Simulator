@@ -68,7 +68,7 @@ function readSwell() {
   const L0 = (9.81 * swell.period ** 2) / (2 * Math.PI);
   $('s-len').textContent = `${Math.round(L0)} m`;
   $('s-speed').textContent = `${Math.round((L0 / swell.period) * 3.6)} km/h`;
-  $('s-set').textContent = `~${swellSpectrum(swell).wavesPerSet} waves`;
+  $('s-set').textContent = `every ${swellSpectrum(swell).wavesPerSet} waves`;
   R.setSwellArrow(swell.direction);
 }
 let swellTimer = 0;
@@ -257,7 +257,21 @@ $('pause').addEventListener('click', () => {
   $('pause').setAttribute('aria-pressed', paused);
   $('pause').textContent = paused ? 'Play' : 'Pause';
 });
-document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => R.setView(b.dataset.view)));
+// What the camera presets need to know about the current beach.
+function viewInfo() {
+  const i = N >> 1;
+  let jS = N - 1;
+  for (let j = 0; j < N; j++) if (beach.z[j * N + i] > beach.waterLevel) { jS = j; break; }
+  return {
+    shoreZ: jS * DX - EXT / 2,
+    breakDist: last ? last.summary.breakDist : 120,
+    breakHeight: last ? 0.82 * last.summary.breakDepth : 3,
+    breakDistTypical: last ? last.summary.breakDistTypical || last.summary.breakDist : 100,
+    spot: last ? last.summary.spot : null,
+    ground: (x, z) => sampleZ(beach.z, x + EXT / 2, z + EXT / 2),
+  };
+}
+document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => R.setView(b.dataset.view, viewInfo())));
 $('menuBtn').addEventListener('click', () => {
   const open = $('rail').classList.toggle('open');
   $('menuBtn').setAttribute('aria-expanded', open);
@@ -390,4 +404,4 @@ let start = null;
 try { const cur = store.get('shorebreak.current'); if (cur) start = decodeBeach(cur); } catch { start = null; }
 setBeach(start || { ...generate({ ...PRESETS.crescent, seed: 7 }), waterLevel: 0 });
 requestAnimationFrame(loop);
-window.__app = { beach, swell, R, setTool, requestSolve, preset: (k) => setBeach({ ...generate({ ...PRESETS[k], seed: 7 }), waterLevel: 0 }), get last() { return last; } };
+window.__app = { beach, swell, R, setTool, requestSolve, viewInfo, preset: (k) => setBeach({ ...generate({ ...PRESETS[k], seed: 7 }), waterLevel: 0 }), get last() { return last; } };
