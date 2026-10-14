@@ -5,7 +5,8 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { N, EXT } from './terrain.js';
 import { NCOMP } from './waves.js';
 
-const SUN = new THREE.Vector3(-0.45, 0.42, -0.79).normalize();
+// Afternoon sun behind the beach, so wave faces are lit as seen from the shore.
+const SUN = new THREE.Vector3(-0.45, 0.42, 0.79).normalize();
 
 const COMMON = /* glsl */ `
 precision highp float;
@@ -65,11 +66,11 @@ export function createRenderer(canvas) {
   const M = coarse ? 320 : 512; // water grid resolution
 
   const scene = new THREE.Scene();
-  const camera = new THREE.PerspectiveCamera(42, 1, 1, 6000);
+  const camera = new THREE.PerspectiveCamera(42, 1, 0.5, 9000);
   const controls = new OrbitControls(camera, canvas);
   controls.enableDamping = true;
   controls.maxPolarAngle = Math.PI * 0.495;
-  controls.minDistance = 30;
+  controls.minDistance = 4;
   controls.maxDistance = 1800;
 
   // --- data textures (written by the solver) -------------------------------
@@ -83,6 +84,7 @@ export function createRenderer(canvas) {
   const compTex = [mk(), mk(), mk(), mk()];
   const bedTex = mk();
   const dirTex = mk();
+  const grpTex = mk();
 
   const rtOpts = { type: THREE.HalfFloatType, format: THREE.RGBAFormat, depthBuffer: false, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter };
   const waveRT = new THREE.WebGLRenderTarget(M, M, rtOpts);
@@ -97,6 +99,7 @@ export function createRenderer(canvas) {
     uHeight: { value: heightTex },
     uBed: { value: bedTex },
     uDir: { value: dirTex },
+    uGrp: { value: grpTex },
     uContours: { value: 0 },
     uBrush: { value: new THREE.Vector4(0, 0, 0, 0) }, // x, y, radius, visible
   };
@@ -115,12 +118,14 @@ export function createRenderer(canvas) {
       uPh: { value: new Array(NCOMP).fill(0) },
       uM: { value: M },
       uActive: { value: 0 },
+      uSetOmega: { value: 0 },
+      uSetDepth: { value: 0 },
     },
     vertexShader: passVS,
     fragmentShader: COMMON + /* glsl */ `
-      uniform sampler2D uC0, uC1, uC2, uC3, uBed, uDir;
+      uniform sampler2D uC0, uC1, uC2, uC3, uBed, uDir, uGrp;
       uniform float uPh[${NCOMP}];
-      uniform float uM, uActive, uTime;
+      uniform float uM, uActive, uTime, uSetOmega, uSetDepth;
       out vec4 o;
       void acc(vec4 c, float p0, float p1, inout vec2 z) {
         float t0 = c.x + p0, t1 = c.z + p1;
@@ -136,37 +141,47 @@ export function createRenderer(canvas) {
         acc(bl(uC1, uv), uPh[2], uPh[3], zc);
         acc(bl(uC2, uv), uPh[4], uPh[5], zc);
         acc(bl(uC3, uv), uPh[6], uPh[7], zc);
-        float env = length(zc) * bed.y;
+        vec4 grp = bl(uGrp, uv);
+        // Sets: a slow swell of the wave height travelling at the group velocity.
+        float setMod = 1.0 + uSetDepth * cos(uSetOmega * (uTime - grp.x));
+        float env = length(zc) * bed.y * setMod * 0.96;
+        float L = max(grp.y, 4.0);
         float phi = atan(zc.y, zc.x);
         float gam = bed.z, plunge = bed.w;
-        float surge = bl(uDir, uv).w;
+        vec4 dir = bl(uDir, uv);
+        float surge = dir.w;
         float r = 2.0 * env / (gam * h);
         // Inside the surf zone (where the solver took energy out) a wave that
         // has already broken keeps going as a bore at a lower height ratio.
         float sz = smoothstep(0.03, 0.2, 1.0 - bed.y);
         float rb = r / mix(1.0, 0.6, sz);
         float ev = min(env, 0.52 * gam * h);
-        float s = clamp(r, 0.0, 1.0);
+        float Hc = 2.0 * ev;
+        float s = clamp(rb, 0.0, 1.0);
         float br = smoothstep(0.92, 1.15, rb) * (1.0 - 0.7 * surge);
-        // Wave profile: phi > 0 is ahead of the crest. As the wave shoals the
-        // front face takes up less of the wavelength (it steepens) and the
-        // crest sharpens while the trough flattens.
+        // Wave profile: t = 0 is the crest, t in (0, ff) the front face ahead
+        // of it. As the wave shoals the crest sharpens and the front face
+        // takes up less of the wavelength, until near breaking it is only
+        // about 1.6 wave heights wide (a wall); a bore has an even steeper front.
         float p = mix(1.0 + 2.4 * s * s, 1.7, br);
-        float ff = mix(mix(0.5, 0.12, s * s * s), 0.09, br);
+        float ffSteep = clamp(max(1.3 * Hc, 2.5) / L, 0.015, 0.5);
+        float ffBore = clamp(max(1.1 * Hc, 2.0) / L, 0.012, 0.5);
+        float ff = mix(mix(0.5, ffSteep, smoothstep(0.25, 0.95, s)), ffBore, br);
         float t = fract(phi / 6.28318);
         float th = t < ff ? 3.14159 * t / ff : 3.14159 * (1.0 + (t - ff) / (1.0 - ff));
         float q = 0.5 + 0.5 * cos(th);
         float m = inversesqrt(3.14159 * (p + 0.25));
-        float eta = 2.0 * ev * (pow(q, p) - m);
+        float eta = Hc * (pow(q, p) - m);
         // Whitewater is lumpy and aerated.
         vec2 wp = uv * uExt;
         eta += br * ev * 0.35 * (fbm2(wp * 0.18 + vec2(uTime * 0.6, 0.0)) - 0.45) * smoothstep(0.1, 0.7, q);
         // Plunging lip: throw the crest forward just as the wave breaks.
-        float lip = plunge * smoothstep(0.8, 1.0, r) * (1.0 - smoothstep(1.05, 1.4, r)) * (1.0 - surge) * (1.0 - 0.8 * sz);
-        float fwd = lip * ev * 2.6 * pow(q, 8.0) + 0.25 * s * s * ev * pow(q, 3.0);
-        vec2 u = bl(uDir, uv).xy;
-        u /= max(length(u), 1e-4);
-        float foam = br * smoothstep(0.2, 0.85, q) * (t < 0.5 ? 1.0 : smoothstep(0.75, 0.95, t)) + lip * 0.8 * smoothstep(0.6, 1.0, q);
+        float lip = plunge * smoothstep(0.8, 1.0, rb) * (1.0 - smoothstep(1.05, 1.4, rb)) * (1.0 - surge) * (1.0 - 0.8 * sz);
+        float fwd = lip * Hc * 1.3 * pow(q, 8.0) + 0.25 * s * s * ev * pow(q, 3.0);
+        vec2 u = dir.xy / max(length(dir.xy), 1e-4);
+        // Whitewater covers the front face and the first stretch behind the crest.
+        float tb = t < ff ? 0.0 : (t - ff) / (1.0 - ff);
+        float foam = br * (t < ff ? smoothstep(0.2, 0.85, q) : smoothstep(0.32, 0.1, tb)) + lip * 0.8 * smoothstep(0.6, 1.0, q);
         o = vec4(eta, fwd * u.x, fwd * u.y, clamp(foam, 0.0, 1.0));
       }`,
     depthTest: false,
@@ -196,7 +211,7 @@ export function createRenderer(canvas) {
         vec4 ps = texture(uPrev, tuv - vel * 0.12 * uDt / uExt);
         float src = texelFetch(uWave, ivec2(gl_FragCoord.xy), 0).w;
         float bore = max(pf.r * exp(-uDt / 2.2), src);
-        float resid = min(1.0, ps.g * exp(-uDt / 16.0) + bore * uDt * 0.45);
+        float resid = min(1.0, ps.g * exp(-uDt / 16.0) + bore * uDt * 0.15);
         if (h < 0.02) { bore = 0.0; resid *= 0.9; }
         o = vec4(bore, resid, 0.0, 1.0);
       }`,
@@ -207,6 +222,35 @@ export function createRenderer(canvas) {
   foamQuad.frustumCulled = false;
   const foamScene = new THREE.Scene();
   foamScene.add(foamQuad);
+
+  // --- sky ---------------------------------------------------------------------
+  const skyMat = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    uniforms: shared,
+    side: THREE.BackSide,
+    depthWrite: false,
+    vertexShader: COMMON + /* glsl */ `
+      out vec3 vD;
+      void main() {
+        vD = position;
+        gl_Position = projectionMatrix * viewMatrix * vec4(position + cameraPosition, 1.0);
+      }`,
+    fragmentShader: COMMON + /* glsl */ `
+      in vec3 vD;
+      out vec4 o;
+      void main() {
+        vec3 d = normalize(vD);
+        vec3 c = sky(vec3(d.x, max(d.y, 0.0), d.z));
+        // Below the horizon: a hazy distant sea.
+        c = mix(c, vec3(0.30, 0.46, 0.56), smoothstep(0.0, -0.08, d.y));
+        o = vec4(c, 1.0);
+      }`,
+  });
+  const skyDome = new THREE.Mesh(new THREE.SphereGeometry(4000, 48, 24), skyMat);
+  skyDome.frustumCulled = false;
+  skyDome.name = 'sky';
+  skyDome.renderOrder = -1;
+  scene.add(skyDome);
 
   // --- terrain -----------------------------------------------------------------
   function gridGeometry(n) {
@@ -275,6 +319,7 @@ export function createRenderer(canvas) {
   });
   const terrain = new THREE.Mesh(gridGeometry(N), terrainMat);
   terrain.frustumCulled = false;
+  terrain.name = 'terrain';
   scene.add(terrain);
 
   // --- diorama walls ---------------------------------------------------------
@@ -332,6 +377,7 @@ export function createRenderer(canvas) {
   });
   const walls = new THREE.Mesh(wallGeometry(N), wallMat);
   walls.frustumCulled = false;
+  walls.name = 'walls';
   scene.add(walls);
 
   // --- water surface -----------------------------------------------------------
@@ -342,6 +388,7 @@ export function createRenderer(canvas) {
     uM: { value: M },
     uCam: { value: camera.position },
     uAlpha: { value: 1 },
+    uDebug: { value: 0 },
   };
   const waterVS = COMMON + /* glsl */ `
     uniform sampler2D uWave, uHeight;
@@ -367,31 +414,41 @@ export function createRenderer(canvas) {
   const waterFS = COMMON + /* glsl */ `
     uniform sampler2D uFoam;
     uniform vec3 uCam;
-    uniform float uContours, uTime, uAlpha;
+    uniform float uContours, uTime, uAlpha, uDebug;
     uniform vec4 uBrush;
     in vec3 vP; in vec3 vN; in float vBedZ; in float vRock; in vec2 vUv; in float vEta;
     out vec4 o;
     void main() {
       float col_h = vP.y - vBedZ;
+      if (uDebug > 0.5) {
+        vec4 fd = texture(uFoam, vUv);
+        if (uDebug < 1.5) o = vec4(fd.rgb, 1.0);
+        else if (uDebug < 2.5) o = vec4(vec3(col_h / 10.0), 1.0);
+        else if (uDebug < 3.5) o = vec4(vUv, 0.0, 1.0);
+        else if (uDebug < 4.5) o = vec4(normalize(vN) * 0.5 + 0.5, 1.0);
+        else o = vec4(vec3(vEta * 0.25 + 0.5), 1.0);
+        return;
+      }
       if (col_h < 0.0) discard;
       vec2 p = vP.xz + uExt * 0.5;
       vec3 n = normalize(vN);
       if (!gl_FrontFacing) n = -n;
       vec3 v = normalize(uCam - vP);
-      float still = max(uWl - vBedZ, 0.0);
+      // Shading normal: exaggerate slopes when looking down from above so
+      // long, low swells still read as lines; true normals at eye level.
+      float ex = mix(1.0, 5.0, smoothstep(0.12, 0.55, v.y));
+      vec3 ns = normalize(vec3(n.x * ex, n.y, n.z * ex));
       // Body colour: the bed seen through the water column.
       vec3 bed = bedColor(vBedZ, vRock, p) * (0.5 + 0.5 * max(SUN.y, 0.0));
       vec3 absorb = exp(-col_h * vec3(0.55, 0.16, 0.12));
       vec3 deep = vec3(0.015, 0.11, 0.17);
       vec3 body = bed * absorb + deep * (1.0 - exp(-col_h * 0.32)) + vec3(0.0, 0.07, 0.07) * (1.0 - absorb.g);
+      body *= 0.5 + 0.8 * max(dot(ns, normalize(SUN + vec3(0.0, 0.25, 0.0))), 0.0);
+      body += vec3(0.02, 0.07, 0.07) * clamp(vEta, -1.0, 2.0);
       // Light through thin crests and wave faces.
       float thick = smoothstep(0.2, 2.0, vEta);
       float sss = pow(max(dot(v, -normalize(SUN + n * 0.5)), 0.0), 3.0) * thick;
-      body += vec3(0.05, 0.42, 0.36) * (sss * 0.9 + thick * 0.18 * (1.0 - n.y));
-      // Exaggerate slopes for shading only, so long low swells read as lines.
-      vec3 ns = normalize(vec3(n.x * 5.0, n.y, n.z * 5.0));
-      body *= 0.5 + 0.8 * max(dot(ns, normalize(SUN + vec3(0.0, 0.25, 0.0))), 0.0);
-      body += vec3(0.02, 0.07, 0.07) * clamp(vEta, -1.0, 2.0);
+      body += vec3(0.05, 0.42, 0.36) * (sss * 0.6 + thick * (0.22 + 0.3 * (1.0 - n.y)));
       float fres = 0.02 + 0.98 * pow(1.0 - max(dot(ns, v), 0.0), 5.0);
       vec3 refl = sky(reflect(-v, ns));
       vec3 c = mix(body, refl, fres);
@@ -400,11 +457,13 @@ export function createRenderer(canvas) {
       // Foam: active whitewater plus the lacy residue it leaves behind.
       vec4 f = texture(uFoam, vUv);
       float tex = fbm2(p * 0.55 + vec2(0.0, uTime * 0.25)) * 0.7 + 0.3 * fbm2(p * 2.1 - uTime * 0.3);
-      float act = smoothstep(0.05, 0.45, f.r * 1.15 - tex * 0.6 + 0.05);
-      float lace = smoothstep(0.55, 0.75, tex + f.g * 0.55) * smoothstep(0.02, 0.35, f.g);
+      // Fine lumps so a sheet of whitewater is not a flat white field up close.
+      float fine = fbm2(p * 1.3 + vec2(uTime * 0.35, -uTime * 0.2));
+      float act = smoothstep(0.05, 0.45, f.r * 1.15 - tex * 0.6 + 0.05) * (0.8 + 0.2 * smoothstep(0.25, 0.75, fine));
+      float lace = smoothstep(0.66, 0.9, tex * 1.1 + 0.3 * f.g) * smoothstep(0.02, 0.45, f.g);
       float shore = smoothstep(0.3, 0.0, col_h) * 0.6 * smoothstep(0.35, 0.65, fbm2(p * 0.25 + uTime * 0.2));
       float foam = clamp(max(act, max(lace * 0.85, shore)), 0.0, 1.0);
-      vec3 fc = vec3(0.93, 0.95, 0.96) * (0.72 + 0.28 * max(dot(n, SUN), 0.0)) + 0.06;
+      vec3 fc = (vec3(0.93, 0.95, 0.96) * (0.72 + 0.28 * max(dot(n, SUN), 0.0)) + 0.06) * (0.9 + 0.12 * fine);
       c = mix(c, fc, foam);
       if (uContours > 0.5) {
         float z = vBedZ - uWl;
@@ -427,6 +486,7 @@ export function createRenderer(canvas) {
   });
   const water = new THREE.Mesh(gridGeometry(M), waterMat);
   water.frustumCulled = false;
+  water.name = 'water';
   water.renderOrder = 2;
   scene.add(water);
 
@@ -463,6 +523,7 @@ export function createRenderer(canvas) {
   });
   const wwalls = new THREE.Mesh(wallGeometry(M), wwallMat);
   wwalls.frustumCulled = false;
+  wwalls.name = 'wwalls';
   wwalls.renderOrder = 3;
   scene.add(wwalls);
 
@@ -507,13 +568,16 @@ export function createRenderer(canvas) {
       }
       compTex[q].needsUpdate = true;
     }
-    const b = bedTex.image.data, r = dirTex.image.data;
+    const b = bedTex.image.data, r = dirTex.image.data, g = grpTex.image.data;
     for (let c = 0; c < N * N; c++) {
       b[c * 4] = res.h[c]; b[c * 4 + 1] = res.D[c]; b[c * 4 + 2] = res.gamma[c]; b[c * 4 + 3] = res.plunge[c];
       r[c * 4] = res.ux[c]; r[c * 4 + 1] = res.uy[c]; r[c * 4 + 2] = res.speed[c]; r[c * 4 + 3] = res.surge[c];
+      g[c * 4] = res.tau[c]; g[c * 4 + 1] = res.lambda[c];
     }
-    bedTex.needsUpdate = dirTex.needsUpdate = true;
+    bedTex.needsUpdate = dirTex.needsUpdate = grpTex.needsUpdate = true;
     omegas = res.omegas; phases = res.phases;
+    waveMat.uniforms.uSetOmega.value = res.setOmega;
+    waveMat.uniforms.uSetDepth.value = res.setDepth;
     waveMat.uniforms.uActive.value = 1;
   }
 
@@ -530,6 +594,7 @@ export function createRenderer(canvas) {
   function frame(dt) {
     resize();
     controls.update();
+    arrows.visible = camera.position.y > 80; // only from high up; they would sit on the horizon at eye level
     simTime += dt;
     shared.uTime.value = simTime;
     const ph = waveMat.uniforms.uPh.value;
@@ -549,14 +614,47 @@ export function createRenderer(canvas) {
     renderer.render(scene, camera);
   }
 
-  function setView(name) {
-    const views = {
-      overview: [[-520, 290, 430], [-100, -6, 10]],
-      lineup: [[-70, 6, -30], [60, 0, 150]],
-      top: [[0, 760, 1], [0, 0, 0]],
-      shore: [[40, 9, 250], [-20, 0, 0]],
-    };
-    const [p, t] = views[name] || views.overview;
+  // Camera presets. `info` describes the current beach: shoreZ (world z of
+  // the waterline at the centre), breakDist (m from the waterline to where
+  // the waves break) and ground(x, z) (sand elevation).
+  function setView(name, info) {
+    const wl = shared.uWl.value;
+    const ground = info ? info.ground : () => wl;
+    const hb = info ? info.breakHeight : 3; // how tall the breaking waves are
+    // The eye-level views stand where the breaking is heaviest (a bar, not
+    // the rip channel beside it); fall back to the centre line.
+    const sp = info && info.spot && info.spot.breakZ != null ? info.spot : null;
+    const sx = sp ? sp.x : 0;
+    const shoreZ = sp && sp.shoreZ != null ? sp.shoreZ : info ? info.shoreZ : EXT * 0.34;
+    const zt = sp ? sp.breakZ : shoreZ - Math.max(info ? info.breakDistTypical : 100, 40); // where the typical wave breaks
+    let p, t, fov = 42;
+    if (name === 'lineup') {
+      // Floating just outside the break, looking along the line at the peak.
+      p = [sx - 70, wl + 1.8 + 0.3 * hb, zt - 20];
+      t = [sx + 30, wl + 0.6, zt + 20];
+      fov = 30;
+    } else if (name === 'impact') {
+      // In the whitewater inside the break, facing the waves. Stands further
+      // in, and rides higher, when the waves are big, so the bores form in
+      // front of it and the whitewater passes underneath.
+      const y = wl + Math.max(2.0, 0.55 * hb);
+      const inset = 16 + 3 * (sp ? sp.depth : 3);
+      p = [sx + 10, y, zt + inset];
+      t = [sx - 4, y - 1.0, zt - 15];
+      fov = 30;
+    } else if (name === 'shore') {
+      // Standing on the sand a few steps up from the water, at eye level.
+      const zc = shoreZ + 12;
+      p = [sx, Math.max(ground(sx, zc), wl) + 1.7, zc];
+      t = [sx - 15, wl + 1.2, zt - 40];
+      fov = 30;
+    } else if (name === 'top') {
+      p = [0, 760, 1]; t = [0, 0, 0];
+    } else {
+      p = [-520, 290, 430]; t = [-100, -6, 10];
+    }
+    camera.fov = fov;
+    camera.updateProjectionMatrix();
     camera.position.set(...p);
     controls.target.set(...t);
     controls.update();
@@ -576,7 +674,7 @@ export function createRenderer(canvas) {
   }
 
   return {
-    renderer, camera, controls, shared,
+    renderer, camera, controls, shared, scene,
     lookAt, setHeight, setWaves, setSwellArrow, frame, setView, gridRay,
     setWaterLevel: (wl) => { shared.uWl.value = wl; },
     setContours: (on) => { shared.uContours.value = on ? 1 : 0; },
@@ -589,5 +687,17 @@ export function createRenderer(canvas) {
       renderer.setRenderTarget(null);
     },
     gridSize: M,
+    setDebug: (v) => { waterUniforms.uDebug.value = v; },
+    // Test hook: elevation statistics of the current wave field.
+    waveStats: () => {
+      const b = new Uint16Array(M * M * 4);
+      renderer.readRenderTargetPixels(waveRT, 0, 0, M, M, b);
+      let mx = -1e9, mn = 1e9, foam = 0;
+      for (let i = 0; i < M * M; i++) { const v = THREE.DataUtils.fromHalfFloat(b[i * 4]); if (v > mx) mx = v; if (v < mn) mn = v; foam = Math.max(foam, THREE.DataUtils.fromHalfFloat(b[i * 4 + 3])); }
+      renderer.readRenderTargetPixels(foamA, 0, 0, M, M, b);
+      let bore = 0, resid = 0;
+      for (let i = 0; i < M * M; i++) { bore = Math.max(bore, THREE.DataUtils.fromHalfFloat(b[i * 4])); resid = Math.max(resid, THREE.DataUtils.fromHalfFloat(b[i * 4 + 1])); }
+      return { mx, mn, foam, bore, resid };
+    },
   };
 }
