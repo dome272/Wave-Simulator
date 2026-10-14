@@ -229,94 +229,80 @@ export function createRenderer(canvas) {
   const waveScene = new THREE.Scene();
   waveScene.add(waveQuad);
 
-  // --- lip footprint mask ----------------------------------------------------
+  // --- barrel mask -------------------------------------------------------------
   // Under a thrown lip the depth-integrated solver still carries its smeared
-  // front; this mask pulls the surface down to the trough beneath the tube
-  // (so the lip mesh forms the roof) and steepens the face into a concave
-  // wall. Built every frame from the breakers' active crest lines.
-  const MAX_FOOT = 24 * 64 * 2; // vertices: breakers x crest samples x 2 sides
+  // front; the breakers report the barrel voids (brk.tubes: one strip per lip
+  // sample) and this mask pulls the surface down to the trough inside them so
+  // the lip curtain forms the roof, and shades the water under the lip.
+  const MAX_TUBES = 24 * 512;
   const maskRT = new THREE.WebGLRenderTarget(M, M, rtOpts);
   const footGeo = new THREE.BufferGeometry();
-  const footPos = new Float32Array(MAX_FOOT * 3), footAttr = new Float32Array(MAX_FOOT * 3); // (s, etaTarget, weight)
+  const footPos = new Float32Array(MAX_TUBES * 4 * 3), footAttr = new Float32Array(MAX_TUBES * 4 * 4); // (a, eta, s, a1)
   footGeo.setAttribute('position', new THREE.BufferAttribute(footPos, 3).setUsage(THREE.DynamicDrawUsage));
-  footGeo.setAttribute('attr', new THREE.BufferAttribute(footAttr, 3).setUsage(THREE.DynamicDrawUsage));
-  const footIdx = new Uint32Array(MAX_FOOT * 3);
-  footGeo.setIndex(new THREE.BufferAttribute(footIdx, 1).setUsage(THREE.DynamicDrawUsage));
+  footGeo.setAttribute('attr', new THREE.BufferAttribute(footAttr, 4).setUsage(THREE.DynamicDrawUsage));
+  const footIdx = new Uint32Array(MAX_TUBES * 6);
+  for (let q = 0; q < MAX_TUBES; q++) {
+    const v = q * 4, k = q * 6;
+    footIdx[k] = v; footIdx[k + 1] = v + 2; footIdx[k + 2] = v + 1; footIdx[k + 3] = v + 1; footIdx[k + 4] = v + 2; footIdx[k + 5] = v + 3;
+  }
+  footGeo.setIndex(new THREE.BufferAttribute(footIdx, 1));
   footGeo.setDrawRange(0, 0);
   const maskMat = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
     uniforms: { uExt: shared.uExt },
     vertexShader: /* glsl */ `
-      in vec3 position; in vec3 attr;
+      in vec3 position; in vec4 attr;
       uniform float uExt;
-      out vec3 vA;
+      out vec4 vA;
       void main() { vA = attr; gl_Position = vec4(position.xz / (uExt * 0.5), 0.0, 1.0); }`,
     fragmentShader: /* glsl */ `
       precision highp float;
-      in vec3 vA;
+      in vec4 vA;
       out vec4 o;
       void main() {
-        // s: 0 at the crest, 1 at the lip's landing line; the surface is held at
-        // the solver crest behind s = 0, drops into the trough under the tube and
-        // feathers out past the landing line.
-        float s = vA.x;
-        float w = vA.z * smoothstep(0.0, 0.18, s) * (1.0 - smoothstep(1.0, 1.35, s));
-        o = vec4(w, vA.y, 0.45 * w * smoothstep(0.75, 1.0, s), w);
+        // a: metres ahead of the crest root inside the strip [a0, a1]: a wall at
+        // the back, soft toward the trough where the lip lands.
+        float a = vA.x, a1 = vA.w;
+        float edge = clamp((a1 - a) / 0.6, 0.0, 1.0);
+        float w = vA.z * edge;
+        float shade = vA.z * max(0.0, 1.0 - a / max(a1 * 0.8, 0.1));
+        o = vec4(w, vA.y, shade, max(w, shade * 0.999));
       }`,
     transparent: true,
     depthTest: false,
     depthWrite: false,
     blending: THREE.CustomBlending,
-    blendEquation: THREE.AddEquation,
-    blendSrc: THREE.SrcAlphaFactor,
-    blendDst: THREE.OneMinusSrcAlphaFactor,
+    blendEquation: THREE.MaxEquation,
+    blendSrc: THREE.OneFactor,
+    blendDst: THREE.OneFactor,
   });
   const footMesh = new THREE.Mesh(footGeo, maskMat);
   footMesh.frustumCulled = false;
   const maskScene = new THREE.Scene();
   maskScene.add(footMesh);
-  // Fill the footprint geometry from the breakers' active crest lines.
-  function updateFootprint(active) {
-    let v = 0, n = 0;
-    const idx = footIdx;
-    for (const b of active || []) {
-      if (!b || !b.points || b.points.length < 2) continue;
-      if (b.state === 'collapsed' && (b.fade || 0) <= 0) continue;
-      const H = b.H || 1;
-      const fade = b.state === 'collapsed' ? (b.fade || 0) : 1;
-      const pts = b.points;
-      const first = v;
-      for (let k = 0; k < pts.length && v + 2 <= MAX_FOOT; k++) {
-        const p = pts[k];
-        // Direction and reach: from the crest sample to its lip tip when the
-        // breakers report one, else straight shoreward by 1.6 H.
-        let dx = 0, dy = 1, reach = 1.6 * H;
-        if (p.tipX != null) {
-          dx = p.tipX - p.x; dy = p.tipY - p.y;
-          const L = Math.hypot(dx, dy);
-          if (L > 0.3) { dx /= L; dy /= L; reach = Math.max(L, 0.6 * H); } else { dx = p.nx || 0; dy = p.ny || 1; }
-        } else if (p.nx != null) { dx = p.nx; dy = p.ny; }
-        const back = 0.25 * reach, fwd = reach * 1.35;
-        const etaT = p.etaT != null ? p.etaT : (b.etaT != null ? b.etaT : p.etaC - H);
-        const wk = (p.w != null ? p.w : 1) * fade;
-        // behind the crest
-        footPos[v * 3] = p.x - dx * back; footPos[v * 3 + 1] = 0; footPos[v * 3 + 2] = p.y - dy * back;
-        footAttr[v * 3] = -back / reach; footAttr[v * 3 + 1] = etaT - 0.15 * H; footAttr[v * 3 + 2] = wk; v++;
-        // past the landing line
-        footPos[v * 3] = p.x + dx * fwd; footPos[v * 3 + 1] = 0; footPos[v * 3 + 2] = p.y + dy * fwd;
-        footAttr[v * 3] = fwd / reach; footAttr[v * 3 + 1] = etaT - 0.15 * H; footAttr[v * 3 + 2] = wk; v++;
-        if (k > 0 && n + 6 <= footIdx.length) {
-          const a = v - 4, bq = v - 3, c = v - 2, d = v - 1;
-          idx[n++] = a; idx[n++] = c; idx[n++] = bq; idx[n++] = bq; idx[n++] = c; idx[n++] = d;
-        }
-      }
-      if (v === first + 1) v = first; // degenerate
+  // Fill the strip geometry from the breakers' tubes.
+  function updateFootprint(tubes) {
+    let q = 0;
+    for (const tb of tubes || []) {
+      if (!tb || tb.s <= 0 || q >= MAX_TUBES) continue;
+      const px = -tb.dy * tb.hw, py = tb.dx * tb.hw; // half-width along the crest
+      const bx = tb.x + tb.dx * tb.a0, by = tb.y + tb.dy * tb.a0;
+      const fx = tb.x + tb.dx * tb.a1, fy = tb.y + tb.dy * tb.a1;
+      const v = q * 4;
+      const put = (k, x, y, a) => {
+        footPos[(v + k) * 3] = x; footPos[(v + k) * 3 + 1] = 0; footPos[(v + k) * 3 + 2] = y;
+        const o = (v + k) * 4; footAttr[o] = a; footAttr[o + 1] = tb.eta; footAttr[o + 2] = tb.s; footAttr[o + 3] = tb.a1;
+      };
+      put(0, bx - px, by - py, tb.a0); put(1, bx + px, by + py, tb.a0);
+      put(2, fx - px, fy - py, tb.a1); put(3, fx + px, fy + py, tb.a1);
+      q++;
     }
     footGeo.attributes.position.needsUpdate = true;
     footGeo.attributes.attr.needsUpdate = true;
-    footGeo.index.needsUpdate = true;
-    footGeo.setDrawRange(0, n);
-    return n > 0;
+    footGeo.attributes.position.addUpdateRange(0, q * 12);
+    footGeo.attributes.attr.addUpdateRange(0, q * 16);
+    footGeo.setDrawRange(0, q * 6);
+    return q > 0;
   }
 
   // --- present pass: engine state -> the M x M wave texture ----------------
@@ -334,9 +320,9 @@ export function createRenderer(canvas) {
         vec4 e = engineSample(uv, wet);
         vec4 mk = texture(uMask, gl_FragCoord.xy / uM);
         float eta = mix(e.x, min(e.x, mk.y), mk.x);
-        // Whitewater source: the breaking field, strongest where the front is
-        // fresh, plus aeration where the lip lands.
-        o = vec4(eta, 0.0, 0.0, max(smoothstep(0.15, 0.6, e.w) * wet, mk.z));
+        // Whitewater source: the breaking field, strongest where the front is fresh.
+        // y carries the tube shadow (the water VS ignores displacement in engine mode).
+        o = vec4(eta, mk.z, 0.0, smoothstep(0.15, 0.6, e.w) * wet);
       }`,
     depthTest: false,
     depthWrite: false,
@@ -576,17 +562,19 @@ export function createRenderer(canvas) {
   };
   const waterVS = COMMON + /* glsl */ `
     uniform sampler2D uWave, uHeight;
-    uniform float uM;
-    out vec3 vP; out vec3 vN; out float vBedZ; out float vRock; out vec2 vUv; out float vEta;
+    uniform float uM, uEngine;
+    out vec3 vP; out vec3 vN; out float vBedZ; out float vRock; out vec2 vUv; out float vEta; out float vShade;
     vec3 wpos(ivec2 ij) {
       ij = clamp(ij, ivec2(0), ivec2(int(uM) - 1));
       vec4 w = texelFetch(uWave, ij, 0);
       vec2 uv = vec2(ij) / (uM - 1.0);
-      return vec3(uv.x * uExt - uExt * 0.5 + w.y, uWl + w.x, uv.y * uExt - uExt * 0.5 + w.z);
+      vec2 disp = w.yz * (1.0 - uEngine);
+      return vec3(uv.x * uExt - uExt * 0.5 + disp.x, uWl + w.x, uv.y * uExt - uExt * 0.5 + disp.y);
     }
     void main() {
       ivec2 ij = ivec2(position.xy);
       vec3 p = wpos(ij);
+      vShade = uEngine * texelFetch(uWave, clamp(ij, ivec2(0), ivec2(int(uM) - 1)), 0).y;
       vec3 n = normalize(cross(wpos(ij + ivec2(0, 1)) - wpos(ij - ivec2(0, 1)), wpos(ij + ivec2(1, 0)) - wpos(ij - ivec2(1, 0))));
       vUv = vec2(ij) / (uM - 1.0);
       vec4 hc = bl(uHeight, vUv);
@@ -600,7 +588,7 @@ export function createRenderer(canvas) {
     uniform vec3 uCam;
     uniform float uContours, uTime, uAlpha, uDebug;
     uniform vec4 uBrush;
-    in vec3 vP; in vec3 vN; in float vBedZ; in float vRock; in vec2 vUv; in float vEta;
+    in vec3 vP; in vec3 vN; in float vBedZ; in float vRock; in vec2 vUv; in float vEta; in float vShade;
     out vec4 o;
     void main() {
       float col_h = vP.y - vBedZ;
@@ -636,6 +624,8 @@ export function createRenderer(canvas) {
       float fres = 0.02 + 0.98 * pow(1.0 - max(dot(ns, v), 0.0), 5.0);
       vec3 refl = sky(reflect(-v, ns));
       vec3 c = mix(body, refl, fres);
+      // Inside a barrel the water is in the lip's shadow.
+      c *= 1.0 - 0.55 * clamp(vShade, 0.0, 1.0);
       vec3 hv = normalize(SUN + v);
       c += vec3(1.0, 0.9, 0.7) * pow(max(dot(n, hv), 0.0), 400.0) * 3.0;
       // Foam: active whitewater plus the lacy residue it leaves behind.
@@ -804,7 +794,7 @@ export function createRenderer(canvas) {
       renderer.setRenderTarget(maskRT);
       renderer.setClearColor(0x000000, 0);
       renderer.clear();
-      if (engine.breakers && updateFootprint(engine.breakers.active)) renderer.render(maskScene, quadCam);
+      if (engine.breakers && updateFootprint(engine.breakers.tubes)) renderer.render(maskScene, quadCam);
       renderer.setRenderTarget(waveRT);
       renderer.render(presentScene, quadCam);
     } else {

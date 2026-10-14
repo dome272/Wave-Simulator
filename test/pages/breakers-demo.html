@@ -1,0 +1,299 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>breakers demo</title>
+<style>html,body{margin:0;background:#000;overflow:hidden}canvas{display:block}</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<canvas id="c" width="1280" height="720"></canvas>
+<script type="module">
+// Headless demo scene for the breakers package: a plane beach (1:15), a flat
+// water plane at wl with the synthetic crest rendered as a displaced bump, the
+// breakers group, and eye-level cameras. Driven from test/breakers-demo.mjs
+// through window.__demo (no animation loop of its own).
+import * as THREE from 'three';
+import { makeScenario, planeBeach, phaseSpeed } from '../synthetic-crests.mjs';
+import { createBreakers } from '../../src/breakers/index.js';
+import { EXT } from '../../src/terrain.js';
+
+const SUN = new THREE.Vector3(-0.45, 0.42, 0.79).normalize();
+const W = 1280, HGT = 720;
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(1);
+renderer.setSize(W, HGT, false);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(34, W / HGT, 0.3, 5000);
+
+// --- scenario -------------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+const slope = +(params.get('slope') || 1 / 15);
+const H = +(params.get('H') || 2.2);
+const wl = 0;
+const beach = planeBeach({ slope, shoreY: 500 });
+const breakY = 460, y0 = 445;
+const etaC = 0.7 * H;
+const hCb = etaC + (500 - breakY) * slope;
+const c = +(params.get('c') || Math.min(phaseSpeed(hCb, etaC), 6.6));
+const swell = { height: H, period: +(params.get('T') || 12), direction: 0, distanceKm: 2000 };
+const sc = makeScenario({ r: 2, beach, wl, crests: [{ y0, c, H, amp: 0.5, lambda: 45, obliq: 0.03, breakY, Lf: 3.5, Lb: 11 }] });
+const brk = createBreakers({ layout: sc.lay, wl, beach, swell, maxParticles: 12000 });
+scene.add(brk.group);
+const dt = 1 / 30;
+let t = 0;
+
+const GLSL = /* glsl */ `
+const vec3 SUN = vec3(${SUN.x.toFixed(4)}, ${SUN.y.toFixed(4)}, ${SUN.z.toFixed(4)});
+float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+float vnoise(vec2 p) { vec2 i = floor(p), f = fract(p); vec2 u = f * f * (3.0 - 2.0 * f);
+  return mix(mix(hash12(i), hash12(i + vec2(1, 0)), u.x), mix(hash12(i + vec2(0, 1)), hash12(i + vec2(1, 1)), u.x), u.y); }
+float fbm2(vec2 p) { return 0.5 * vnoise(p) + 0.25 * vnoise(p * 2.03 + 7.1) + 0.125 * vnoise(p * 4.1 + 3.3) + 0.0625 * vnoise(p * 8.3 + 1.7); }
+vec3 sky(vec3 d) { float y = max(d.y, 0.0); vec3 c = mix(vec3(0.80, 0.86, 0.90), vec3(0.32, 0.55, 0.82), pow(y, 0.55));
+  float s = max(dot(d, SUN), 0.0); c += vec3(1.0, 0.86, 0.62) * (pow(s, 600.0) * 30.0 + pow(s, 12.0) * 0.25); return c; }
+vec3 bedColor(float z, vec2 p, float wl) { float n = fbm2(p * 0.08);
+  vec3 dry = vec3(0.89, 0.81, 0.64) * (0.92 + 0.16 * n); vec3 wet = vec3(0.66, 0.58, 0.44); vec3 under = vec3(0.80, 0.73, 0.56) * (0.9 + 0.2 * n);
+  return z > wl + 0.9 ? dry : z > wl - 0.1 ? mix(wet, dry, smoothstep(wl + 0.1, wl + 0.9, z)) : under; }
+`;
+
+// --- sky ----------------------------------------------------------------------------
+const skyMat = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, side: THREE.BackSide, depthWrite: false,
+  vertexShader: `out vec3 vD; void main(){ vD = position; gl_Position = projectionMatrix * viewMatrix * vec4(position + cameraPosition, 1.0); }`,
+  fragmentShader: GLSL + `in vec3 vD; out vec4 o; void main(){ vec3 d = normalize(vD); vec3 c = sky(vec3(d.x, max(d.y, 0.0), d.z)); c = mix(c, vec3(0.30, 0.46, 0.56), smoothstep(0.0, -0.08, d.y)); o = vec4(c, 1.0); }` });
+const skyDome = new THREE.Mesh(new THREE.SphereGeometry(3000, 40, 20), skyMat);
+skyDome.frustumCulled = false; skyDome.renderOrder = -1;
+scene.add(skyDome);
+
+// --- terrain (plane beach) -------------------------------------------------------
+const ground = (x, z) => (z + EXT / 2 - 500) * slope;
+const terrGeo = new THREE.PlaneGeometry(700, 700, 140, 140);
+terrGeo.rotateX(-Math.PI / 2);
+{ const p = terrGeo.attributes.position; for (let i = 0; i < p.count; i++) p.setY(i, ground(p.getX(i), p.getZ(i))); terrGeo.computeVertexNormals(); }
+const terrMat = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, uniforms: { uWl: { value: wl } },
+  vertexShader: `out vec3 vP; out vec3 vN; void main(){ vP = position; vN = normal; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: GLSL + `uniform float uWl; in vec3 vP; in vec3 vN; out vec4 o; void main(){ vec3 n = normalize(vN); vec3 base = bedColor(vP.y, vP.xz + 318.75, uWl); float dif = max(dot(n, SUN), 0.0); o = vec4(base * (0.42 * vec3(0.85, 0.92, 1.0) + 0.85 * dif * vec3(1.0, 0.95, 0.86)), 1.0); }` });
+scene.add(new THREE.Mesh(terrGeo, terrMat));
+
+// --- water: a displaced grid around the break -----------------------------------------
+const X0 = -200, X1 = 200, Z0 = 40, Z1 = 210, RES = 1.25;
+const NX = Math.round((X1 - X0) / RES) + 1, NZ = Math.round((Z1 - Z0) / RES) + 1;
+const wGeo = new THREE.BufferGeometry();
+const wPos = new Float32Array(NX * NZ * 3), wFoam = new Float32Array(NX * NZ), wShade = new Float32Array(NX * NZ);
+const wIdx = new Uint32Array((NX - 1) * (NZ - 1) * 6);
+{ let k = 0; for (let j = 0; j < NZ - 1; j++) for (let i = 0; i < NX - 1; i++) { const a = j * NX + i, b = a + 1, c2 = a + NX, d = c2 + 1; wIdx[k++] = a; wIdx[k++] = c2; wIdx[k++] = b; wIdx[k++] = b; wIdx[k++] = c2; wIdx[k++] = d; } }
+wGeo.setAttribute('position', new THREE.BufferAttribute(wPos, 3));
+wGeo.setAttribute('foam', new THREE.BufferAttribute(wFoam, 1));
+wGeo.setAttribute('shade', new THREE.BufferAttribute(wShade, 1));
+wGeo.setIndex(new THREE.BufferAttribute(wIdx, 1));
+wGeo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 2000);
+const waterMat = new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, side: THREE.DoubleSide, uniforms: { uWl: { value: wl }, uTime: { value: 0 }, uSlope: { value: slope } },
+  vertexShader: `in float foam; in float shade; out vec3 vP; out vec3 vN; out float vFoam; out float vShade; void main(){ vP = position; vN = normal; vFoam = foam; vShade = shade; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: GLSL + `
+    uniform float uWl, uTime, uSlope; in vec3 vP; in vec3 vN; in float vFoam; in float vShade; out vec4 o;
+    void main(){
+      float bedZ = (vP.z + 318.75 - 500.0) * uSlope;
+      float col_h = vP.y - bedZ;
+      if (col_h < 0.0) discard;
+      vec3 n = normalize(vN); if (!gl_FrontFacing) n = -n;
+      vec3 v = normalize(cameraPosition - vP);
+      vec2 p = vP.xz + 318.75;
+      float vEta = vP.y - uWl;
+      vec3 bed = bedColor(bedZ, p, uWl) * (0.5 + 0.5 * max(SUN.y, 0.0));
+      vec3 absorb = exp(-col_h * vec3(0.55, 0.16, 0.12));
+      vec3 deep = vec3(0.015, 0.11, 0.17);
+      vec3 body = bed * absorb + deep * (1.0 - exp(-col_h * 0.32)) + vec3(0.0, 0.07, 0.07) * (1.0 - absorb.g);
+      body *= 0.5 + 0.8 * max(dot(n, normalize(SUN + vec3(0.0, 0.25, 0.0))), 0.0);
+      body += vec3(0.02, 0.07, 0.07) * clamp(vEta, -1.0, 2.0);
+      float thick = smoothstep(0.2, 2.0, vEta);
+      float sss = pow(max(dot(v, -normalize(SUN + n * 0.5)), 0.0), 3.0) * thick;
+      body += vec3(0.05, 0.42, 0.36) * (sss * 0.6 + thick * (0.22 + 0.3 * (1.0 - n.y)));
+      float fres = 0.02 + 0.98 * pow(1.0 - max(dot(n, v), 0.0), 5.0);
+      vec3 c = mix(body, sky(reflect(-v, n)), fres);
+      vec3 hv = normalize(SUN + v);
+      c += vec3(1.0, 0.9, 0.7) * pow(max(dot(n, hv), 0.0), 400.0) * 3.0;
+      float tex = fbm2(p * 0.55 + vec2(0.0, uTime * 0.25)) * 0.7 + 0.3 * fbm2(p * 2.1 - uTime * 0.3);
+      float fine = fbm2(p * 1.3 + vec2(uTime * 0.35, -uTime * 0.2));
+      float act = smoothstep(0.05, 0.45, vFoam * 1.15 - tex * 0.6 + 0.05) * (0.8 + 0.2 * smoothstep(0.25, 0.75, fine));
+      float shore = smoothstep(0.3, 0.0, col_h) * 0.6 * smoothstep(0.35, 0.65, fbm2(p * 0.25 + uTime * 0.2));
+      float foam = clamp(max(act, shore), 0.0, 1.0);
+      vec3 fc = (vec3(0.93, 0.95, 0.96) * (0.72 + 0.28 * max(dot(n, SUN), 0.0)) + 0.06) * (0.9 + 0.12 * fine);
+      c = mix(c, fc, foam);
+      c *= 1.0 - 0.55 * vShade; // inside the tube: the lip shades the floor and the back wall
+      o = vec4(c, 1.0);
+    }` });
+const water = new THREE.Mesh(wGeo, waterMat);
+water.frustumCulled = false; water.renderOrder = 2;
+scene.add(water);
+
+const hitT = new Float32Array(NX).fill(-1); // per water column: time the lip landed there (face whitewater after impact)
+const tubeBin = []; // water column -> tube descriptors near it
+function updateWater() {
+  const decay = Math.exp(-dt / 2.5);
+  for (const a of brk.active) for (const pt of a.points) if (pt.phase >= 1) {
+    const i0 = Math.max(0, Math.floor((pt.x - 0.7 - X0) / RES)), i1 = Math.min(NX - 1, Math.ceil((pt.x + 0.7 - X0) / RES));
+    for (let i = i0; i <= i1; i++) if (hitT[i] < 0) hitT[i] = t;
+  }
+  // The barrel voids: what the app's present pass does with brk.tubes (lower the surface to wl + eta inside each strip,
+  // blended by s), applied here to the synthetic surface. Bin the strips by water column first.
+  tubeBin.length = NX;
+  for (let i = 0; i < NX; i++) tubeBin[i] = null;
+  for (const tb of brk.tubes) {
+    if (tb.s <= 0) continue;
+    const i0 = Math.max(0, Math.floor((tb.x - tb.hw - 0.3 - X0) / RES)), i1 = Math.min(NX - 1, Math.ceil((tb.x + tb.hw + 0.3 - X0) / RES));
+    for (let i = i0; i <= i1; i++) (tubeBin[i] || (tubeBin[i] = [])).push(tb);
+  }
+  for (let j = 0; j < NZ; j++) for (let i = 0; i < NX; i++) {
+    const k = j * NX + i, x = X0 + i * RES, z = Z0 + j * RES;
+    const gx = x + EXT / 2, gy = z + EXT / 2;
+    let e = sc.eta(gx, gy, t), shade = 0;
+    const bin = tubeBin[i];
+    if (bin) {
+      let carve = 0, target = 0;
+      for (const tb of bin) {
+        const rx = x - tb.x, rz = z - tb.y;
+        const a = rx * tb.dx + rz * tb.dy, b = Math.abs(rx * tb.dy - rz * tb.dx);
+        if (b > tb.hw || a < tb.a0 || a > tb.a1) continue;
+        const edge = Math.min(1, (tb.a1 - a) / 0.6); // soft toward the trough, a wall at the back
+        const w = tb.s * edge;
+        if (w > carve) { carve = w; target = wl + tb.eta; }
+        shade = Math.max(shade, tb.s * Math.max(0, 1 - a / (tb.a1 * 0.8)));
+      }
+      if (carve > 0) e = e + (Math.min(e, target) - e) * carve;
+    }
+    wPos[k * 3] = x; wPos[k * 3 + 1] = wl + e; wPos[k * 3 + 2] = z;
+    wShade[k] = shade;
+    let f = wFoam[k] * decay;
+    const yC = sc.crestY(0, gx, t), d = gy - yC;
+    const hit = hitT[i];
+    if (hit >= 0 && d > -1.5 && d < 6) f = Math.max(f, 0.85 * Math.min(1, (t - hit) / 0.8) * (d > 1 ? 1 : 0.6));
+    wFoam[k] = f;
+  }
+  for (const s of brk.splats) {
+    const i0 = Math.max(0, Math.floor((s.x - s.r - X0) / RES)), i1 = Math.min(NX - 1, Math.ceil((s.x + s.r - X0) / RES));
+    const j0 = Math.max(0, Math.floor((s.y - s.r - Z0) / RES)), j1 = Math.min(NZ - 1, Math.ceil((s.y + s.r - Z0) / RES));
+    for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+      const d = Math.hypot(X0 + i * RES - s.x, Z0 + j * RES - s.y) / s.r;
+      if (d < 1) { const k = j * NX + i; wFoam[k] = Math.max(wFoam[k], s.s * Math.sqrt(1 - d)); }
+    }
+  }
+  wGeo.attributes.position.needsUpdate = true;
+  wGeo.attributes.foam.needsUpdate = true;
+  wGeo.attributes.shade.needsUpdate = true;
+  wGeo.computeVertexNormals();
+  waterMat.uniforms.uTime.value = t;
+}
+
+// --- stepping ---------------------------------------------------------------------------
+const XC = 0; // world x of the reference column (camera target)
+function sampleAt(x) {
+  let best = null, bd = 1e9;
+  for (const a of brk.active) for (const pt of a.points) { const d = Math.abs(pt.x - x); if (d < bd) { bd = d; best = { pt, a }; } }
+  return bd < 2 ? best : null;
+}
+function step() {
+  brk.update(sc.records(t), dt, { t, swell, camera, viewportHeight: HGT });
+  updateWater();
+  t += dt;
+}
+// Does the next frame's record switch FC on for any column? (the crest line is oblique and sinusoidal: the first column
+// to break is not the reference one)
+function anyBreaksNext() {
+  for (let col = 0; col < sc.lay.V; col++) if (sc.crestY(0, (col + 0.5) * sc.lay.dxs, t + dt) >= breakY) return true;
+  return false;
+}
+const conds = {
+  before: () => brk.active.length === 0 && anyBreaksNext(), // no lip anywhere yet; the first column arms on the next frame
+  mid: () => { const s = sampleAt(XC); return s && s.pt.p >= 0.5; },
+  impact: () => { const s = sampleAt(XC); return s && s.pt.phase >= 1 && s.pt.s - s.pt.tau >= 0.12; },
+  collapsed: () => { const s = sampleAt(XC); return s && s.pt.s - s.pt.tau >= 0.5 + 0.18; },
+};
+function stepUntil(name, max = 600) {
+  let n = 0;
+  while (!conds[name]() && n < max) { step(); n++; }
+  return info(name, n);
+}
+function info(name, n) {
+  const s = sampleAt(XC);
+  const pt = s && s.pt;
+  return { moment: name, steps: n, t: +t.toFixed(3), crests: brk.crests.length, active: brk.active.length, tubes: brk.tubes.length, spray: brk.spray.count,
+    indexCount: brk.mesh.indexCount, slots: brk.mesh.usedSlots,
+    sample: pt && { state: s.a.state, phase: pt.phase, p: +pt.p.toFixed(3), s: +pt.s.toFixed(3), tau: +pt.tau.toFixed(3), H: +pt.H.toFixed(2), xi: +pt.xi.toFixed(3), c: +pt.c.toFixed(2), R: +pt.R.toFixed(2), w: +pt.w.toFixed(2), tipSpeed: +(pt.c + pt.u).toFixed(2), rootZ: +pt.rootZ.toFixed(2), tipZ: +pt.tipZ.toFixed(2), tipY: +pt.tipY.toFixed(2), n: s.a.n } };
+}
+
+// --- views ------------------------------------------------------------------------------
+// Everything is placed relative to the lip at the camera's own x (the crest
+// line is oblique and sinusoidal, so the reference column's numbers do not
+// hold a few metres along the line).
+function lipAt(x) {
+  const s = sampleAt(x);
+  const gx = x + EXT / 2;
+  const rootZ = s ? s.pt.rootZ : sc.crestY(0, gx, t) - EXT / 2;
+  const tau = Math.sqrt((2 * H) / 9.81);
+  const R = s ? s.pt.R : brk.model.tubeWidth(H, 0.7);
+  const p = s ? s.pt.p : 0, u = s ? s.pt.u : R / tau;
+  const tipZ = s ? s.pt.tipZ : rootZ, tipY = s ? s.pt.tipY : wl + etaC;
+  const raw = (a) => wl + sc.eta(gx, rootZ + a + EXT / 2, t);
+  const surf = (a) => (s && a >= 0.1 * R && a <= 4 * H ? Math.min(raw(a), wl + s.pt.etaT) : raw(a)); // the carved tube floor
+  const curtain = (a) => { const tp = a / u; return wl + etaC - 0.5 * 9.81 * tp * tp; };
+  return { rootZ, R, p, u, tipZ, tipY, surf, curtain, s };
+}
+function view(name) {
+  const L = lipAt(XC);
+  const zc = L.rootZ;
+  if (name === 'beach') {
+    // standing in the shallows shoreward of the break, eye level, facing the wave
+    const z = zc + 15;
+    camera.fov = 30; camera.position.set(XC - 3, Math.max(ground(XC, z), wl) + 1.7, z);
+    camera.lookAt(XC - 5, wl + 0.9, zc + 2);
+  } else if (name === 'impact') {
+    // inside the tube, looking down the barrel along the crest (toward the end still to break)
+    const xa = XC + 12, xb = XC - 14;
+    const A = lipAt(xa), B = lipAt(xb);
+    const aA = Math.max(0.5, 0.55 * A.R), aB = Math.max(0.5, 0.55 * B.R);
+    const yA = A.surf(aA) + 0.45 * Math.max(0.6, A.curtain(aA) - A.surf(aA));
+    const yB = B.surf(aB) + 0.35 * Math.max(0.6, B.curtain(aB) - B.surf(aB));
+    camera.fov = 58; camera.position.set(xa, yA, A.rootZ + aA);
+    camera.lookAt(xb, yB, B.rootZ + aB);
+  } else if (name === 'lineup') {
+    // in the lineup beside the peak, looking along the line into the opening barrel
+    camera.fov = 32; camera.position.set(XC - 34, wl + 1.9, zc + 1.5);
+    camera.lookAt(XC + 8, wl + 0.6, zc + 2.5);
+  } else if (name === 'paddle') {
+    // paddling out just inside the impact zone, eye just above the water, looking up at the lip
+    camera.fov = 50; camera.position.set(XC + 2, wl + 0.9, zc + 7.5);
+    camera.lookAt(XC - 3, wl + 1.1, zc + 1.0);
+  } else if (name === 'side') {
+    camera.fov = 30; camera.position.set(XC + 36, wl + 2.0, zc + 2);
+    camera.lookAt(XC - 4, wl + 0.6, zc + 2.5);
+  } else if (name === 'low') {
+    // under the lip: eye 0.35 m above the water, 3 m ahead of the tip, looking up at the sheet
+    camera.fov = 60; camera.position.set(XC, wl + 0.35, L.tipZ + 3.0);
+    camera.lookAt(XC - 2, L.tipY + 0.6, zc + 1.0);
+  } else if (name === 'shoulder') {
+    // surfer on the shoulder: eye 1.2 m, 18 m along the line toward the end still to break, looking into the barrel
+    camera.fov = 45; camera.position.set(XC - 18, wl + 1.2, zc + 2.5);
+    camera.lookAt(XC + 4, wl + 0.8, zc + 2.0);
+  } else if (name === 'crouch') {
+    // beach spectator crouching, eye 0.8 m, 12 m shoreward of the tip
+    camera.fov = 40; camera.position.set(XC + 1, wl + 0.8, L.tipZ + 12);
+    camera.lookAt(XC - 1, wl + 1.0, zc + 1);
+  }
+  camera.updateProjectionMatrix();
+  brk.spray.setCamera(camera, HGT);
+  renderer.render(scene, camera);
+  return { view: name, cam: camera.position.toArray().map((v) => +v.toFixed(2)) };
+}
+
+step();
+window.__demo = { step, stepUntil, view, info: () => info('now', 0), ready: true, brk, sc, camera, renderer, scene, lipAt, XC, wl, H, etaC, c,
+  setCam: (p, l, fov) => { camera.fov = fov; camera.position.set(p[0], p[1], p[2]); camera.lookAt(l[0], l[1], l[2]); camera.updateProjectionMatrix(); brk.spray.setCamera(camera, HGT); renderer.render(scene, camera); return { cam: camera.position.toArray() }; } };
+</script>
+</body>
+</html>
