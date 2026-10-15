@@ -1,0 +1,25 @@
+<!doctype html><html><head><meta charset="utf-8"><title>lip mesh shader compile check</title>
+<script type="importmap">{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }</script></head>
+<body><canvas id="c" width="320" height="240"></canvas>
+<script type="module">
+import * as THREE from 'three';
+import { createLipMesh } from '../../src/breakers/lip-mesh.js';
+import { createSpray } from '../../src/breakers/spray.js';
+const errors = [];
+const origErr = console.error; console.error = (...a) => { errors.push(a.join(' ')); origErr(...a); };
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('c') });
+const scene = new THREE.Scene(), cam = new THREE.PerspectiveCamera(60, 4 / 3, 0.1, 100);
+const lip = createLipMesh({ meshSlots: 8 });
+// one stitched pair of loops so both materials actually draw
+const prof = { a: new Float32Array(9), y: new Float32Array(9), th: new Float32Array(9).fill(0.2), fu: new Float32Array(9).fill(0.3), fl: new Float32Array(9).fill(0.3), al: new Float32Array(9).fill(1), alpha: 1 };
+for (let k = 0; k < 9; k++) { prof.a[k] = k * 0.3; prof.y[k] = 1 - 0.1 * k * k; }
+const model = { lipProfile: (b, i, out) => { out.a.set(prof.a); out.y.set(prof.y); out.th.set(prof.th); out.fu.set(prof.fu); out.fl.set(prof.fl); out.al.set(prof.al); out.alpha = 1; return out; }, splashProfile: () => false, lay: { dxs: 2.5 } };
+const b = { id: 1, n: 2, done: false, c0: 0, x: new Float32Array([0, 2.5]), zRoot: new Float32Array([-5, -5]), dirX: new Float32Array([0, 0]), dirZ: new Float32Array([1, 1]), slotLip: new Int32Array([-1, -1]), slotSplash: new Int32Array([-1, -1]) };
+lip.update(model, [b], { wl: 0, t: 1 });
+scene.add(lip.depthMesh, lip.mesh);
+const spray = createSpray({}); scene.add(spray.points);
+cam.position.set(1, 1, 0); cam.lookAt(1, 0.5, -5);
+renderer.render(scene, cam);
+const progs = renderer.info.programs.map((p) => ({ name: p.name, diag: p.diagnostics ? (p.diagnostics.fragmentShader?.log || p.diagnostics.vertexShader?.log || 'failed') : null }));
+window.__out = { errors, progs, drawRange: lip.geometry.drawRange.count, usedSlots: lip.usedSlots, slots: Array.from(b.slotLip), calls: renderer.info.render.calls };
+</script></body></html>
