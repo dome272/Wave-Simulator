@@ -139,6 +139,32 @@ export function createRenderer(canvas) {
     if (ww < 0.35) return vec4(bl(uHeight, uv).x - uWl - 0.08, 0.0, 0.0, 0.0);
     return vec4(W / ww - uWl, u / ww, v / ww, F);
   }
+  // The surface for display: a cubic B-spline over 4x4 cells (wet-weighted).
+  // The shock-capturing scheme leaves cell-scale roughness along a bore front
+  // that bilinear sampling turns into pyramids at eye level; the spline rounds
+  // it to a bump a cell wide and keeps the front where it is.
+  float engineEtaSmooth(vec2 uv, out float wetness) {
+    vec2 tc = uv * uExt / uLay.z + uLay.xy - 0.5;
+    ivec2 sz = textureSize(uState, 0);
+    ivec2 i0 = ivec2(floor(tc));
+    vec2 f = tc - vec2(i0);
+    vec2 f2 = f * f, f3 = f2 * f;
+    vec4 wx = vec4((1.0 - 3.0 * f.x + 3.0 * f2.x - f3.x), (4.0 - 6.0 * f2.x + 3.0 * f3.x), (1.0 + 3.0 * f.x + 3.0 * f2.x - 3.0 * f3.x), f3.x) / 6.0;
+    vec4 wy = vec4((1.0 - 3.0 * f.y + 3.0 * f2.y - f3.y), (4.0 - 6.0 * f2.y + 3.0 * f3.y), (1.0 + 3.0 * f.y + 3.0 * f2.y - 3.0 * f3.y), f3.y) / 6.0;
+    float W = 0.0, ww = 0.0;
+    for (int j = 0; j < 4; j++) {
+      for (int i = 0; i < 4; i++) {
+        ivec2 ij = clamp(i0 + ivec2(i - 1, j - 1), ivec2(0), sz - 1);
+        float w = wx[i] * wy[j];
+        vec4 st = texelFetch(uState, ij, 0);
+        float wet = smoothstep(0.005, 0.04, st.x);
+        W += w * wet * (texelFetch(uBathy, ij, 0).x + st.x); ww += w * wet;
+      }
+    }
+    wetness = ww;
+    if (ww < 0.35) return bl(uHeight, uv).x - uWl - 0.08;
+    return W / ww - uWl;
+  }
   `;
 
   // --- wave pass -----------------------------------------------------------
@@ -308,16 +334,18 @@ export function createRenderer(canvas) {
   // --- present pass: engine state -> the M x M wave texture ----------------
   const presentMat = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
-    uniforms: { ...shared, uM: { value: M }, uMask: { value: maskRT.texture } },
+    uniforms: { ...shared, uM: { value: M }, uMask: { value: maskRT.texture }, uSmooth: { value: 1 } },
     vertexShader: passVS,
     fragmentShader: COMMON + ENGINE_GLSL + /* glsl */ `
-      uniform float uM;
+      uniform float uM, uSmooth;
       uniform sampler2D uMask;
       out vec4 o;
       void main() {
         vec2 uv = (gl_FragCoord.xy - 0.5) / (uM - 1.0);
-        float wet;
+        float wet, wetS;
         vec4 e = engineSample(uv, wet);
+        float etaS = engineEtaSmooth(uv, wetS);
+        e.x = mix(e.x, etaS, uSmooth);
         vec4 mk = texture(uMask, gl_FragCoord.xy / uM);
         float eta = mix(e.x, min(e.x, mk.y), mk.x);
         // Whitewater source: the breaking field, weighted by the steepness of
@@ -904,6 +932,7 @@ export function createRenderer(canvas) {
     },
     gridSize: M,
     setDebug: (v) => { waterUniforms.uDebug.value = v; },
+    setSmoothSurface: (on) => { presentMat.uniforms.uSmooth.value = on ? 1 : 0; },
     // Test hook: elevation statistics of the current wave field.
     waveStats: () => {
       const b = new Uint16Array(M * M * 4);
