@@ -397,5 +397,39 @@ console.log('\n# 10. Spray particles: emission, gravity, wind drift, death');
   sp.dispose(); sp2.dispose();
 }
 
+// --- water level moves mid-throw: absolute elevations hold -----------------------------
+{
+  const cs = standardCase({});
+  const brk = createBreakers({ layout: cs.sc.lay, wl: 0, beach: cs.beach, swell: cs.swell });
+  let t = 0, b = null, i = -1;
+  for (let f = 0; f < 100 && !b; f++, t += DT) {
+    brk.update(cs.sc.records(t), DT, { t, wl: 0, swell: cs.swell });
+    const a = brk.active[0];
+    if (a && a.points[120].p >= 0.3) { b = brk.model.breakers[0]; i = 120 - b.c0; }
+  }
+  const prof = brk.model.newProfile();
+  const before = { launch: 0 + b.etaC[i], root: b.yRoot[i], floor: 0 + brk.tubes.find((tb) => Math.abs(tb.y - b.zRoot[i]) < 1e-6).eta, sheet: brk.model.lipProfile(b, i, prof).y[1] };
+  // the solver keeps the absolute surface when the level moves, so the records' eta drop by 1 m
+  const shifted = cs.sc.records(t); for (let k = 0; k < shifted.length; k += 8) if (shifted[k] >= 0) { shifted[k + 1] -= 1; shifted[k + 4] -= 1; }
+  brk.update(shifted, DT, { t, wl: 1, swell: cs.swell });
+  const after = { launch: 1 + b.etaC[i], root: b.yRoot[i], floor: 1 + brk.tubes.find((tb) => Math.abs(tb.y - b.zRoot[i]) < 1e-6).eta, sheet: brk.model.lipProfile(b, i, prof).y[1] };
+  const ok = Math.abs(after.launch - before.launch) < 1e-6 && Math.abs(after.floor - before.floor) < 1e-6 && Math.abs(after.root - before.root) < 1e-3 && Math.abs(after.sheet - before.sheet) < 1e-3;
+  check('tide +1 m mid-throw: launch height, tube floor, root and sheet keep their absolute elevation', ok, `launch ${f3(before.launch)} -> ${f3(after.launch)}, floor ${f3(before.floor)} -> ${f3(after.floor)}, root ${f3(before.root)} -> ${f3(after.root)}, sheet ${f3(before.sheet)} -> ${f3(after.sheet)}`);
+  brk.dispose();
+}
+
+// --- a sample without a curtain loop gets no tube carve ---------------------------------
+{
+  const cs = standardCase({});
+  const brk = createBreakers({ layout: cs.sc.lay, wl: 0, beach: cs.beach, swell: cs.swell, meshSlots: 100 });
+  let t = 0, frames = 0, n = 0;
+  for (let f = 0; f < 100 && frames < 3; f++, t += DT) {
+    brk.update(cs.sc.records(t), DT, { t, swell: cs.swell });
+    if (brk.active.length) { frames++; n = brk.model.breakers.reduce((s, b) => s + b.n, 0); }
+  }
+  check('tubes are only carved under samples that own a curtain loop (100-loop pool, wider lip)', n > 100 && brk.tubes.length === brk.mesh.usedSlots && brk.tubes.length <= 100, `${n} samples, ${brk.mesh.usedSlots} loops, ${brk.tubes.length} tubes`);
+  brk.dispose();
+}
+
 console.log(`\n${failures} failure(s)`);
 process.exit(failures ? 1 : 0);

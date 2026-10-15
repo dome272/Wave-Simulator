@@ -119,7 +119,7 @@ export function createBreakers({ layout, wl = 0, beach = null, swell = null, ...
     return api;
   }
 
-  function setWaterLevel(v) { wl = v; model.setWaterLevel(v); mesh.material.uniforms.uWl.value = v; }
+  function setWaterLevel(v) { tracker.shiftElevations(wl - v); wl = v; model.setWaterLevel(v); mesh.material.uniforms.uWl.value = v; }
 
   function dispose() {
     group.remove(mesh.depthMesh, mesh.mesh, spray.points);

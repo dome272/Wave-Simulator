@@ -89,6 +89,7 @@ const within = (c) => c.dh <= TOL.dh && c.dP <= TOL.dP && c.dQ <= TOL.dQ && !c.n
     check('plane beach: F equal where the reference has F = 0 or 1 away from the 3-cell ramp', c.dFclean <= TOL.dF && c.flips === 0, `max|dF| clean=${e(c.dFclean)} all=${e(c.dF)} decision flips=${c.flips}; reference F: ${r.refF.ones} cells =1, ${r.refF.mid} intermediate, ${r.refF.zeros} =0`);
     check('plane beach: crest scan matches the CPU scan', r.crest.slotMismatch === 0 && r.crest.maxDiff <= 1e-4, `${r.crest.records} records, max diff ${e(r.crest.maxDiff)}`);
     check('plane beach: maxSpeed reduction', Math.abs(r.maxSpeed.gpu - r.maxSpeed.cpu) <= 1e-4 * r.maxSpeed.cpu, `gpu ${r.maxSpeed.gpu.toFixed(4)} cpu ${r.maxSpeed.cpu.toFixed(4)} m/s`);
+    check('plane beach: asynchronous maxSpeed (issue + poll) returns the same value on a later frame', r.maxSpeed.issued && r.maxSpeed.asyncFrames >= 1 && Math.abs(r.maxSpeed.async - r.maxSpeed.gpu) <= 1e-6 * r.maxSpeed.gpu, `async ${r.maxSpeed.async.toFixed(4)} after ${r.maxSpeed.asyncFrames} frame(s)`);
   }
 }
 // 3b. bathymetry update

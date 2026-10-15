@@ -66,7 +66,8 @@ export function gridToCell(lay, x, y)  // -> [I, J] (fractional)
 Constants and switches to copy: `BQ = 1/15`, `theta = 1.3`, `eps = 0.05`
 (desingularisation), `hDry = 1e-4`, `dispDepth`, breaking parameters
 `{ onsetRatio: 0.8, onsetSlope: 0.65, slopeRes: 0.18, keepSlope: 0.15,
-memory: 2.0, ramp: 3 }`, the slope clamp (+-0.2) inside the dispersive terms,
+memory: 2.0, ramp: 3 }` (`ramp` is in cells: the driver passes `round(7.5 m / dxs)`, so
+both tiers dilate the broken region by the same 7.5 m), the slope clamp (+-0.2) inside the dispersive terms,
 `chiBed` (dispersion fades out in very shallow water and on steep beds), the
 `Wd` rule (dry cells contribute the still water level to the dispersive
 stencils), the clamping of `d` and of `eta/d`. Read the file; where the GPU
@@ -81,8 +82,10 @@ reduce to shallow-water equations).
 Time step: `dt = 0.25 * dxs / amax` with `amax` the largest `|u| + sqrt(g h)`
 expected; the app passes `dt` in (it estimates `amax` from the bathymetry
 and the swell: `sqrt(g*(dmax + H)) + 2`), and the solver exposes `maxSpeed()`
-(a GPU reduction, read back at most every ~1 s) so the app can halve `dt` if
-that estimate is exceeded.
+(a GPU reduction plus a synchronous readback) and the pair `maxSpeedIssue()` /
+`maxSpeedPoll()` (the same reduction read back behind a fence on a later
+frame, so the check never drains the GPU queue) so the driver can halve `dt`
+every few seconds if that estimate is exceeded.
 
 ## 3. GPU solver API (`src/engine/gpu-solver.js`)
 
@@ -98,7 +101,9 @@ sol.step(dt, t)                 // one SSP-RK2 step; t is the simulation time at
 sol.textures.state              // THREE.Texture nx*ny RGBA32F: (h, P, Q, F)   -- read by the renderer
 sol.textures.bathy              // THREE.Texture nx*ny RGBA32F: (B, d, chiBed, n)   -- B cell bed, d = wl - B
 sol.readCrests()                // Float32Array (see section 5): the crest-scan pass, read back through a pixel buffer one call behind (asyncCrests: false reads synchronously)
-sol.maxSpeed()                  // number (m/s), from a reduction pass + small readback
+sol.maxSpeed()                  // number (m/s), from a reduction pass + small synchronous readback
+sol.maxSpeedIssue()             // true: the reduction is queued and read back behind a fence (false: no reduction on this grid, use maxSpeed())
+sol.maxSpeedPoll()              // the issued result once the GPU has finished it (-1 until then: at least the next frame)
 sol.readState()                 // Float32Array(nx*ny*4) copy of the state texture (tests only)
 sol.loadState(h, P, Q, F)       // Float64Array/Float32Array per field, nx*ny (tests only)
 sol.passesPerStep               // number, for the README

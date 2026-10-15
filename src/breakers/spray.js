@@ -122,7 +122,8 @@ export function createSpray(userOpts = {}) {
       lifeN[i] = 1 - age[i] / life[i];
     }
     geo.setDrawRange(0, n);
-    for (const [att, sz] of [[posA, 3], [sizeA, 1], [lifeA, 1], [seedAtt, 1]]) {
+    // (a zero-length range would upload the whole pool: WebGL2 reads 0 as "to the end")
+    if (n > 0) for (const [att, sz] of [[posA, 3], [sizeA, 1], [lifeA, 1], [seedAtt, 1]]) {
       att.clearUpdateRanges();
       att.addUpdateRange(0, n * sz);
       att.needsUpdate = true;

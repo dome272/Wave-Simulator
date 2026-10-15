@@ -361,7 +361,7 @@ export function createLipModel(lay, userOpts = {}) {
       const H = b.H[i], c = b.c[i], w = b.w[i];
       // tube: the void under the curtain, from the back wall (tubeBack w ahead of the root) to beyond the
       // solver's face toe; the renderer lowers its surface to etaT there (blended by s)
-      if (phase < 3 && b.alpha[i] > 0) {
+      if (phase < 3 && b.alpha[i] > 0 && b.slotLip[i] !== -2) { // -2: the mesh pool had no loop for this sample, so no roofless trench
         const a0 = o.tubeBack * w, a1 = clamp(Math.max(w + 0.5 * H, 1.25 * b.face[i] + dxs), w + 0.5 * H, 4 * H + dxs);
         const eT = 0.3 + 0.7 * b.taper[i]; // the void closes with the ribbon at the ends (same factor as the curtain's throw)
         pushTube(b.x[i], b.zRoot[i], b.dirX[i], b.dirZ[i], a0, a0 + (a1 - a0) * eT, hw, b.etaT[i], clamp(s / o.tubeRamp, 0, 1) * b.alpha[i] * b.taper[i], H);
@@ -505,7 +505,14 @@ export function createLipModel(lay, userOpts = {}) {
   const self = {
     options: o, lay, breakers, classify, update, lipProfile, splashProfile, newProfile, tubeWidth,
     onRelease: null, // called with the breaker just before it is recycled (the mesh layer frees its vertex slots)
-    setWaterLevel: (v) => { wl = v; },
+    setWaterLevel: (v) => {
+      // The solver keeps the absolute surface when the level moves (it
+      // rebases h onto the same bed), so the crest elevations frozen at launch,
+      // which are relative to wl, shift the other way.
+      const d = wl - v;
+      wl = v;
+      if (d) for (const b of breakers) for (let i = 0; i < b.n; i++) { b.etaC[i] += d; b.etaT[i] += d; b.etaCNow[i] += d; }
+    },
     get wl() { return wl; },
     get active() { return activeOut; },
     get tubes() { return tubes; },

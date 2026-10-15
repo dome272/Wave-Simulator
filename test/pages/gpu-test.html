@@ -126,7 +126,7 @@ cases.solitary = () => {
 function maxSpeedCPU(st, Nc) { let m = 0; for (let c = 0; c < Nc; c++) { const h = st[c * 4]; if (h > 1e-4) m = Math.max(m, Math.hypot(st[c * 4 + 1], st[c * 4 + 2]) / h + Math.sqrt(G * h)); } return m; }
 
 // 3. Plane beach (reference test 5), relaxation zone with the plane-wave target, hot start from the target at t0.
-cases.beach = () => {
+cases.beach = async () => {
   const nx = 8, ny = 480, dx = 1.25;
   const d0 = 8, slope = 1 / 30, flat = 120;
   const bed = corners(nx, ny, dx, (x, y) => (y < flat ? -d0 : -d0 + (y - flat) * slope));
@@ -158,8 +158,12 @@ cases.beach = () => {
   const crest = crestCheck(gpu, st, nx, ny, dx, 0, 0, 0, nx, ny);
   const vmax = gpu.maxSpeed();
   const vmaxCPU = maxSpeedCPU(st, nx * ny);
+  // the asynchronous path: issued now, available on a later frame
+  const issued = gpu.maxSpeedIssue();
+  let vAsync = -1, asyncFrames = 0;
+  while (issued && vAsync < 0 && asyncFrames < 30) { await new Promise((r) => requestAnimationFrame(r)); asyncFrames++; vAsync = gpu.maxSpeedPoll(); }
   gpu.dispose();
-  return { nx, ny, dx, steps, dt, t0, init: { dh: init.dh, dP: init.dP, dQ: init.dQ }, final, conv, refF: { ones: nF1, zeros: nF0, mid: nMid }, crest, maxSpeed: { gpu: vmax, cpu: vmaxCPU } };
+  return { nx, ny, dx, steps, dt, t0, init: { dh: init.dh, dP: init.dP, dQ: init.dQ }, final, conv, refF: { ones: nF1, zeros: nF0, mid: nMid }, crest, maxSpeed: { gpu: vmax, cpu: vmaxCPU, issued, async: vAsync, asyncFrames } };
 };
 
 // CPU version of the crest scan (section 5) on a state readback, compared with readCrests().
@@ -344,11 +348,11 @@ cases.bench = (opts = {}) => {
   return out;
 };
 
-window.runCase = (name, opts) => { try { const r = cases[name](opts); log(name + ': ' + JSON.stringify(r)); return r; } catch (e) { log(name + ' ERROR ' + (e.stack || e)); return { error: String(e.stack || e) }; } };
+window.runCase = async (name, opts) => { try { const r = await cases[name](opts); log(name + ': ' + JSON.stringify(r)); return r; } catch (e) { log(name + ' ERROR ' + (e.stack || e)); return { error: String(e.stack || e) }; } };
 window.__mods = { THREE, renderer, createGpuSolver, createSolver, relaxField, wavenumberMS, G, solve, layout, cornerBed, cornerManning, sampleNodes, N, DX, corners };
 window.__ready = true;
 const q = new URLSearchParams(location.search).get('case');
-if (q) { const out = {}; for (const name of q.split(',')) out[name] = window.runCase(name); window.__out = out; }
+if (q) (async () => { const out = {}; for (const name of q.split(',')) out[name] = await window.runCase(name); window.__out = out; })();
 </script>
 </body>
 </html>

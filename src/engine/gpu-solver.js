@@ -76,7 +76,9 @@ export function createGpuSolver(renderer, o = {}) {
 
   // --- data textures ---------------------------------------------------------------
   const mkData = (w, h) => { const t = new THREE.DataTexture(new Float32Array(w * h * 4), w, h, THREE.RGBAFormat, THREE.FloatType); t.minFilter = t.magFilter = THREE.NearestFilter; t.needsUpdate = true; return t; };
-  const cornerTex = mkData(nx + 1, ny + 1);
+  // Corner bed (x) and Manning n (y): two channels, so a bed rebuild uploads half of what RGBA would.
+  const cornerTex = new THREE.DataTexture(new Float32Array((nx + 1) * (ny + 1) * 2), nx + 1, ny + 1, THREE.RGFormat, THREE.FloatType);
+  cornerTex.minFilter = cornerTex.magFilter = THREE.NearestFilter; cornerTex.needsUpdate = true;
   let loadTex = null;
   const compTex = [], kTex = [];
   let auxTex = null;
@@ -149,7 +151,7 @@ export function createGpuSolver(renderer, o = {}) {
   // --- bed -------------------------------------------------------------------------------
   function uploadCorners(z, n) {
     const d = cornerTex.image.data, M = (nx + 1) * (ny + 1);
-    for (let c = 0; c < M; c++) { d[c * 4] = z[c]; d[c * 4 + 1] = typeof n === 'number' ? n : n[c]; }
+    for (let c = 0; c < M; c++) { d[c * 2] = z[c]; d[c * 2 + 1] = typeof n === 'number' ? n : n[c]; }
     cornerTex.needsUpdate = true;
   }
   // (Re)run the bed pass and rebase the water surface onto the new bed.
@@ -240,6 +242,7 @@ export function createGpuSolver(renderer, o = {}) {
     run(hotMat, S[cur]);
     updateChi();
     end(st);
+    invalidateCrests();
   }
 
   // --- one Euler stage: recon, flux, rhs, PCR; returns the PCR target holding the solved systems ---
@@ -312,6 +315,7 @@ export function createGpuSolver(renderer, o = {}) {
     run(loadMat, S[cur]);
     updateChi();
     end(st);
+    invalidateCrests();
   }
   const crestBuf = new Float32Array(crestRT.width * crestRT.height * 4);
   const crestOut = new Float32Array(crestCols * K * 8).fill(-1); // J = -1: no crest
@@ -320,7 +324,8 @@ export function createGpuSolver(renderer, o = {}) {
   // for the solver passes queued ahead of it. The breakers then run one call
   // behind the solver. `asyncCrests: false` reads synchronously (the tests).
   const gl = renderer.getContext();
-  const useAsync = (o.asyncCrests ?? true) && typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
+  const isGL2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
+  const useAsync = (o.asyncCrests ?? true) && isGL2;
   const crestRTs = useAsync ? [crestRT, mkRT(crestCols, 2 * K)] : [crestRT];
   const crestPBO = useAsync ? [gl.createBuffer(), gl.createBuffer()] : null;
   const crestFence = [null, null];
@@ -328,6 +333,13 @@ export function createGpuSolver(renderer, o = {}) {
   if (useAsync) {
     for (const b of crestPBO) { gl.bindBuffer(gl.PIXEL_PACK_BUFFER, b); gl.bufferData(gl.PIXEL_PACK_BUFFER, crestBuf.byteLength, gl.STREAM_READ); }
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  }
+  // A new state (hot start, load) makes the scan in flight stale: drop it, so
+  // the next call reports no crests instead of the old field's.
+  function invalidateCrests() {
+    if (useAsync) for (let i = 0; i < 2; i++) if (crestFence[i]) { gl.deleteSync(crestFence[i]); crestFence[i] = null; }
+    crestHave = false;
+    crestOut.fill(-1);
   }
   function readCrests() {
     const st = begin();
@@ -364,8 +376,8 @@ export function createGpuSolver(renderer, o = {}) {
     }
     return crestOut;
   }
-  function maxSpeed() {
-    const st = begin();
+  // The reduction passes: max speed per block down to a <= 16 x 16 target (null on tiny grids).
+  function reduceSpeed() {
     let src = stateTex(), w = nx, h = ny, last = null;
     for (let k = 0; k < red.length; k++) {
       const u = redMat.uniforms;
@@ -373,10 +385,16 @@ export function createGpuSolver(renderer, o = {}) {
       run(redMat, red[k]);
       src = red[k].texture; w = red[k].width; h = red[k].height; last = red[k];
     }
+    return last;
+  }
+  function maxOfRed(w, h) { let m = 0; for (let c = 0; c < w * h; c++) if (redBuf[c * 4] > m) m = redBuf[c * 4]; return m; }
+  function maxSpeed() {
+    const st = begin();
+    const last = reduceSpeed();
     let m = 0;
     if (last) {
-      renderer.readRenderTargetPixels(last, 0, 0, w, h, redBuf);
-      for (let c = 0; c < w * h; c++) if (redBuf[c * 4] > m) m = redBuf[c * 4];
+      renderer.readRenderTargetPixels(last, 0, 0, last.width, last.height, redBuf);
+      m = maxOfRed(last.width, last.height);
     } else {
       const buf = readTexture(stateTex(), nx, ny, new Float32Array(nx * ny * 4));
       for (let c = 0; c < nx * ny; c++) { const hc = buf[c * 4]; if (hc > U.uHDry.value) { const s = Math.hypot(buf[c * 4 + 1], buf[c * 4 + 2]) / hc + Math.sqrt(G * hc); if (s > m) m = s; } }
@@ -385,12 +403,45 @@ export function createGpuSolver(renderer, o = {}) {
     return m;
   }
 
+  // Asynchronous speed check: maxSpeedIssue() queues the reduction and its
+  // readback behind a fence and returns true; maxSpeedPoll() returns the
+  // result once the GPU has finished it (-1 until then, which is at least the
+  // next frame), so the check never drains the queue inside a frame. Grids too
+  // small for a reduction (and WebGL1) report false: use maxSpeed().
+  const speedPBO = isGL2 && red.length ? gl.createBuffer() : null;
+  let speedFence = null;
+  if (speedPBO) { gl.bindBuffer(gl.PIXEL_PACK_BUFFER, speedPBO); gl.bufferData(gl.PIXEL_PACK_BUFFER, redBuf.byteLength, gl.STREAM_READ); gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null); }
+  function maxSpeedIssue() {
+    if (!speedPBO) return false;
+    const st = begin();
+    const last = reduceSpeed();
+    if (speedFence) { gl.deleteSync(speedFence); speedFence = null; }
+    renderer.state.bindFramebuffer(gl.FRAMEBUFFER, renderer.properties.get(last).__webglFramebuffer);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, speedPBO);
+    gl.readPixels(0, 0, last.width, last.height, gl.RGBA, gl.FLOAT, 0);
+    speedFence = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    end(st);
+    return true;
+  }
+  function maxSpeedPoll() {
+    if (!speedFence) return -1;
+    if (gl.getSyncParameter(speedFence, gl.SYNC_STATUS) !== gl.SIGNALED) return -1;
+    gl.deleteSync(speedFence); speedFence = null;
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, speedPBO);
+    gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, redBuf);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    const last = red[red.length - 1];
+    return maxOfRed(last.width, last.height);
+  }
+
   function dispose() {
     if (useAsync) {
       for (const b of crestPBO) gl.deleteBuffer(b);
       for (let i = 0; i < 2; i++) if (crestFence[i]) { gl.deleteSync(crestFence[i]); crestFence[i] = null; }
       crestRTs[1].dispose();
     }
+    if (speedPBO) { gl.deleteBuffer(speedPBO); if (speedFence) { gl.deleteSync(speedFence); speedFence = null; } }
     for (const t of allRT) t.dispose();
     for (const m of materials) m.dispose();
     geo.dispose();
@@ -423,6 +474,6 @@ export function createGpuSolver(renderer, o = {}) {
     textures: { get state() { return stateTex(); }, get bathy() { return bathyTex(); }, get aux() { return auxState(); }, get coef() { return coefRT.texture; }, get target() { return targetRT.texture; }, get slope() { return slopeTex(); } },
     get wl() { return U.uWl.value; },
     setBathymetry, setBed, setWaterLevel, setTargets, setPlaneTarget, hotStart, step,
-    readCrests, maxSpeed, readState, readField, loadState, textureMemoryMB, dispose,
+    readCrests, maxSpeed, maxSpeedIssue, maxSpeedPoll, readState, readField, loadState, textureMemoryMB, dispose,
   };
 }

@@ -109,9 +109,11 @@ export function createSolver(o) {
   const wrapJ = (j) => (periodicY ? (j + ny) % ny : Math.min(ny - 1, Math.max(0, j)));
   const clampJ = wrapJ;
 
+  let bedRef = null; // the current corner bed (the wall faces at i = 0 / j = 0 read it)
   function setBed(bed, manning) {
     const sx = nx + 1;
     if (bed.length !== sx * (ny + 1)) throw new Error(`bed must hold (nx+1)*(ny+1) corner values, got ${bed.length}`);
+    bedRef = bed;
     for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
       const c = j * nx + i;
       const c00 = bed[j * sx + i], c10 = bed[j * sx + i + 1], c01 = bed[(j + 1) * sx + i], c11 = bed[(j + 1) * sx + i + 1];
@@ -126,8 +128,8 @@ export function createSolver(o) {
     updateDepth();
   }
   // West face of cell (i,j) is the east face of (i-1,j); for a wall at i=0 use the cell's own west corners.
-  const bedW = (i, j) => (i > 0 ? Bx[j * nx + i - 1] : periodicX ? Bx[j * nx + nx - 1] : 0.5 * (o.bed[j * (nx + 1)] + o.bed[(j + 1) * (nx + 1)]));
-  const bedS = (i, j) => (j > 0 ? By[(j - 1) * nx + i] : periodicY ? By[(ny - 1) * nx + i] : 0.5 * (o.bed[i] + o.bed[i + 1]));
+  const bedW = (i, j) => (i > 0 ? Bx[j * nx + i - 1] : periodicX ? Bx[j * nx + nx - 1] : 0.5 * (bedRef[j * (nx + 1)] + bedRef[(j + 1) * (nx + 1)]));
+  const bedS = (i, j) => (j > 0 ? By[(j - 1) * nx + i] : periodicY ? By[(ny - 1) * nx + i] : 0.5 * (bedRef[i] + bedRef[i + 1]));
 
   function setWaterLevel(w) {
     const dw = w - wl;

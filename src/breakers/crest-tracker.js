@@ -116,6 +116,12 @@ export function createTracker(lay, opts = {}) {
   const colJ = new Float32Array(K), colSlot = new Int8Array(K);
   const used = new Uint8Array(K);
 
+  // A record with a non-finite channel is treated as empty: it would poison
+  // the column's running averages for good and spread along the crest.
+  function finiteRecord(rec, b) {
+    for (let ch = 0; ch < CH; ch++) if (!Number.isFinite(rec[b + ch])) return false;
+    return true;
+  }
   function linkColumns(rec) {
     for (const l of lines) linePool.push(l);
     lines.length = 0;
@@ -124,7 +130,7 @@ export function createTracker(lay, opts = {}) {
       let m = 0;
       for (let s = 0; s < K; s++) {
         const b = (col * K + s) * CH;
-        if (rec[b] >= 0 && Number.isFinite(rec[b])) { colJ[m] = rec[b]; colSlot[m] = s; used[m] = 0; m++; }
+        if (rec[b] >= 0 && finiteRecord(rec, b)) { colJ[m] = rec[b]; colSlot[m] = s; used[m] = 0; m++; }
       }
       // match the open lines (from col-1, or across a short hole) to this column's records: greedy by row distance, same slot first
       const next = nextOpen;
@@ -392,8 +398,13 @@ export function createTracker(lay, opts = {}) {
   // Grid coordinates of a column / of a crest sample (for consumers)
   function colX(col) { return (col + 0.5) * dxs; }
 
+  // The water level moved by -d (the solver keeps the absolute surface, so the
+  // records' elevations shift by d): shift the running averages with them.
+  function shiftElevations(d) {
+    for (const cr of crests) for (let col = 0; col < V; col++) if (cr.age[col] >= 0) { cr.etaC[col] += d; cr.etaT[col] += d; }
+  }
   return {
-    crests, update, colX, lay,
+    crests, update, colX, lay, shiftElevations,
     get time() { return tNow; },
     options: { maxCrests, linkCells, dropAfter, fitWindow, minLineCols, matchDist },
     // Tests: the lines linked in the last frame

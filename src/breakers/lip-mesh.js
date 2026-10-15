@@ -41,6 +41,17 @@ vec3 sky(vec3 d, vec3 sun) {
 }
 `;
 
+const CURTAIN_VS = /* glsl */ `
+  in vec4 aux;
+  out vec3 vP; out vec3 vN; out vec2 vUv; out vec4 vAux;
+  void main() {
+    vP = (modelMatrix * vec4(position, 1.0)).xyz;
+    vN = normalize(mat3(modelMatrix) * normal);
+    vUv = uv; vAux = aux;
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    gl_Position = projectionMatrix * mv;
+  }`;
+
 export function createCurtainMaterial(opts = {}) {
   const sun = (opts.sun ? new THREE.Vector3().fromArray(opts.sun) : DEFAULT_SUN.clone()).normalize();
   const mat = new THREE.ShaderMaterial({
@@ -52,16 +63,7 @@ export function createCurtainMaterial(opts = {}) {
       uTint: { value: new THREE.Vector3(0.16, 0.62, 0.56) }, // thin-sheet colour
       uDeep: { value: new THREE.Vector3(0.02, 0.17, 0.24) }, // thick-sheet colour
     },
-    vertexShader: /* glsl */ `
-      in vec4 aux;
-      out vec3 vP; out vec3 vN; out vec2 vUv; out vec4 vAux;
-      void main() {
-        vP = (modelMatrix * vec4(position, 1.0)).xyz;
-        vN = normalize(mat3(modelMatrix) * normal);
-        vUv = uv; vAux = aux;
-        vec4 mv = modelViewMatrix * vec4(position, 1.0);
-        gl_Position = projectionMatrix * mv;
-      }`,
+    vertexShader: CURTAIN_VS,
     fragmentShader: GLSL_COMMON + /* glsl */ `
       uniform vec3 uSun, uTint, uDeep;
       uniform float uTime, uWl;
@@ -151,13 +153,22 @@ export function createLipMesh(opts = {}) {
   // blending its upper and lower faces in index order leaves slivers of the
   // underside showing along every cross-section. A colour-less copy writes
   // depth in the opaque pass; the shaded pass (depthWrite off, LessEqual)
-  // then only colours the nearest layer. Both share the geometry.
-  const depthMat = material.clone(); // same shaders => bit-identical depth
-  depthMat.uniforms = material.uniforms;
-  depthMat.colorWrite = false;
-  depthMat.transparent = false;
-  depthMat.depthWrite = true;
-  depthMat.depthFunc = THREE.LessEqualDepth;
+  // then only colours the nearest layer. Both share the geometry and the
+  // vertex shader (so the depth is bit-identical); the pre-pass fragment
+  // shader only repeats the discard, not the shading.
+  const depthMat = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    vertexShader: CURTAIN_VS,
+    fragmentShader: /* glsl */ `
+      in vec4 vAux;
+      out vec4 o;
+      void main() { if (vAux.y <= 0.003) discard; o = vec4(0.0); }`,
+    colorWrite: false,
+    transparent: false,
+    depthWrite: true,
+    depthFunc: THREE.LessEqualDepth,
+    side: THREE.DoubleSide,
+  });
   const depthMesh = new THREE.Mesh(geo, depthMat);
   depthMesh.frustumCulled = false;
   depthMesh.name = 'lip-curtains-depth';
@@ -241,7 +252,8 @@ export function createLipMesh(opts = {}) {
     // runs short (many wide lips at once) drops splash sheets, never pieces of a curtain.
     for (const b of breakers) {
       owners.set(b.id, b);
-      for (let i = 0; i < b.n; i++) if (b.slotLip[i] < 0 && free.length) b.slotLip[i] = free.pop();
+      // -2 marks a sample the pool could not serve this frame (the model withholds its tube carve)
+      for (let i = 0; i < b.n; i++) if (b.slotLip[i] < 0) b.slotLip[i] = free.length ? free.pop() : -2;
     }
     for (const b of breakers) {
       let prevLip = -1, prevSplash = -1;
@@ -272,15 +284,19 @@ export function createLipMesh(opts = {}) {
     }
     if (!breakers.length && free.length === SLOTS) watermark = 0;
     geo.setDrawRange(0, nIdx);
+    // Upload only what was written: a zero-length range would make WebGL2
+    // send the whole pool (bufferSubData reads "0" as "to the end").
     const nv = watermark * NLOOP;
-    for (const [att, sz] of [[posA, 3], [nrmA, 3], [uvA, 2], [auxA, 4]]) {
+    if (nv > 0) for (const [att, sz] of [[posA, 3], [nrmA, 3], [uvA, 2], [auxA, 4]]) {
       att.clearUpdateRanges();
       att.addUpdateRange(0, nv * sz);
       att.needsUpdate = true;
     }
-    idxA.clearUpdateRanges();
-    idxA.addUpdateRange(0, nIdx);
-    idxA.needsUpdate = true;
+    if (nIdx > 0) {
+      idxA.clearUpdateRanges();
+      idxA.addUpdateRange(0, nIdx);
+      idxA.needsUpdate = true;
+    }
     material.uniforms.uTime.value = t;
     material.uniforms.uWl.value = wl;
   }

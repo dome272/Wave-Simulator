@@ -20,7 +20,8 @@ const swellKey = (s) => `${s.height}|${s.period}|${s.direction}|${s.distanceKm}`
 
 export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {}) {
   const lay = mods.layout(r);
-  const solver = mods.createGpuSolver(renderer, { r });
+  // Metre-defined breaking parameters are converted per tier so both tiers run the same physics.
+  const solver = mods.createGpuSolver(renderer, { r, breakingParams: { ramp: Math.round(7.5 / lay.dxs) } });
   let breakers = null;
   let beach = null, wl = 0, swell = null, targets = null, swellSig = '';
   let t = 0;        // simulation time (s)
@@ -30,7 +31,7 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
   let sinceBrk = 0; // simulated time since the breakers were last updated
   let needHot = true;
   const stats = { msStep: 0, stepsPerFrame: 0, overruns: 0, frames: 0, slow: 0 };
-  let speedCheck = 0;
+  let speedCheck = 0, speedPending = false;
   // Where the waves break, from the crest scan: per visible column the most
   // offshore breaking crest seen lately (grid y, m) and how big it was.
   const K = 6, CH = 8;
@@ -131,11 +132,18 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
   // Advance the simulation by dtSim seconds of simulated time.
   function advance(dtSim, ctx = null) {
     if (!targets || !beach) return 0;
-    if (needHot) { solver.hotStart(t); needHot = false; acc = 0; dtLimit = Infinity; retime(); }
+    if (needHot) hotStart();
     acc += dtSim;
     sinceBrk += dtSim;
     let n = Math.floor(acc / dt);
-    if (n > maxStepsPerFrame) { n = maxStepsPerFrame; acc = n * dt; stats.overruns++; }
+    if (n > maxStepsPerFrame) {
+      // Overrun: the time that is dropped from the solver clock leaves the
+      // breakers' clock too, so lips, spray and crest ages advance with the water.
+      n = maxStepsPerFrame;
+      sinceBrk -= acc - n * dt;
+      acc = n * dt;
+      stats.overruns++;
+    }
     stats.frames++;
     const t0 = performance.now();
     for (let k = 0; k < n; k++) { solver.step(dt, t); t += dt; }
@@ -151,24 +159,40 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
       updateBreakLine(rec, sinceBrk);
       if (brk) brk.update(rec, sinceBrk, { t, wl, beach, swell, ...(ctx || {}) });
       sinceBrk = 0;
-      // Every few seconds make sure the time step still respects the fastest wave.
+      // Every few seconds make sure the time step still respects the fastest
+      // wave. The reduction is read back asynchronously (a frame or more later)
+      // so the check never drains the GPU queue inside a frame.
+      if (speedPending) {
+        const s = solver.maxSpeedPoll();
+        if (s >= 0) { speedPending = false; applySpeed(s); }
+      }
       if ((speedCheck += dtSim) > 3) {
         speedCheck = 0;
-        const s = solver.maxSpeed();
-        if (s * dt / lay.dxs > 0.4) { dtLimit = dt * 0.5; dt = dtLimit; stats.slow++; }
+        if (solver.maxSpeedIssue && solver.maxSpeedIssue()) speedPending = true;
+        else applySpeed(solver.maxSpeed());
       }
     }
     return n;
   }
+  function applySpeed(s) {
+    if (s * dt / lay.dxs > 0.4) { dtLimit = dt * 0.5; dt = dtLimit; stats.slow++; }
+  }
+  function hotStart() {
+    solver.hotStart(t);
+    needHot = false; acc = 0; dtLimit = Infinity; speedPending = false;
+    retime();
+  }
 
   // Time one solver step (ms), forcing the GPU to finish. Used once at start
-  // to pick the resolution tier.
+  // to pick the resolution tier. The clock advances with the steps, as in
+  // advance(), so the interior never runs ahead of the relaxation forcing.
   function probe(steps = 12) {
-    if (needHot) { solver.hotStart(t); needHot = false; }
-    solver.step(dt, t); solver.maxSpeed();
+    if (needHot) hotStart();
+    solver.step(dt, t); t += dt; solver.maxSpeed();
     const t0 = performance.now();
-    for (let k = 0; k < steps; k++) solver.step(dt, t);
+    for (let k = 0; k < steps; k++) { solver.step(dt, t); t += dt; }
     solver.maxSpeed();
+    acc = 0;
     return (performance.now() - t0) / steps;
   }
 

@@ -99,9 +99,9 @@ function updateVerdict(s) {
 }
 
 // --- beach -----------------------------------------------------------------------
-function heightChanged() {
+function heightChanged(engineToo = true) {
   R.setHeight(beach);
-  if (engine) engine.setBeach(beach, beach.waterLevel);
+  if (engine && engineToo) engine.setBeach(beach, beach.waterLevel);
 }
 function setBeach(b, keepWl) {
   beach.z = b.z; beach.rock = b.rock;
@@ -346,6 +346,7 @@ canvas.addEventListener('pointermove', (e) => {
 const endPaint = () => {
   if (!painting) return;
   painting = false;
+  if (engine) engine.setBeach(beach, beach.waterLevel); // the stroke's final bed (the loop rebuilds it every 4th frame)
   requestSolve();
   autosave();
 };
@@ -391,13 +392,15 @@ window.addEventListener('keydown', (e) => {
 });
 
 // --- main loop ---------------------------------------------------------------------------
-let prevT = performance.now(), probeTick = 0;
+let prevT = performance.now(), probeTick = 0, paintTick = 0;
 function loop(t) {
   const dt = Math.min(0.05, (t - prevT) / 1000);
   prevT = t;
   if (painting && paintPt) {
     brush(beach, tool, paintPt[0], paintPt[1], +radiusIn.value, +strengthIn.value, dt, flatTarget);
-    heightChanged();
+    // The engine's bed rebuild re-uploads the whole corner grid and rebases the
+    // water, so while the brush is down it runs every 4th frame (endPaint lands the last one).
+    heightChanged((paintTick++ & 3) === 0);
     R.setBrush(paintPt[0], paintPt[1], +radiusIn.value, true);
     if (t - lastSolveReq > 350) { lastSolveReq = t; requestSolve(); }
   }
