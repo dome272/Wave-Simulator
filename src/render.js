@@ -102,7 +102,70 @@ export function createRenderer(canvas) {
     uGrp: { value: grpTex },
     uContours: { value: 0 },
     uBrush: { value: new THREE.Vector4(0, 0, 0, 0) }, // x, y, radius, visible
+    uFoam: { value: foamA.texture },
+    uEngine: { value: 0 },
+    // Real-fluid engine: solver state (h, P, Q, F), bathymetry (B, d, chiBed, n)
+    // and the layout (lateral margin, offshore margin, cell size) in solver cells.
+    uState: { value: null },
+    uBathy: { value: null },
+    uLay: { value: new THREE.Vector4(0, 0, 2.5, 0) },
   };
+
+  // Sampling the engine's state texture at a visible grid position (uv in
+  // 0..1 across the terrain). Returns (eta above wl, u, v, F); the surface is
+  // interpolated between wet cells only, so the waterline stays crisp.
+  const ENGINE_GLSL = /* glsl */ `
+  uniform sampler2D uState, uBathy, uHeight;
+  uniform vec4 uLay;
+  uniform float uEngine;
+  vec4 engineSample(vec2 uv, out float wetness) {
+    vec2 tc = uv * uExt / uLay.z + uLay.xy - 0.5;
+    ivec2 sz = textureSize(uState, 0);
+    ivec2 i0 = ivec2(floor(tc));
+    vec2 f = tc - vec2(i0);
+    float W = 0.0, ww = 0.0, F = 0.0, u = 0.0, v = 0.0;
+    for (int k = 0; k < 4; k++) {
+      ivec2 ij = clamp(i0 + ivec2(k & 1, k >> 1), ivec2(0), sz - 1);
+      float w = ((k & 1) == 0 ? 1.0 - f.x : f.x) * ((k >> 1) == 0 ? 1.0 - f.y : f.y);
+      vec4 st = texelFetch(uState, ij, 0);
+      vec4 b = texelFetch(uBathy, ij, 0);
+      float wet = smoothstep(0.005, 0.04, st.x);
+      W += w * wet * (b.x + st.x); ww += w * wet;
+      F += w * st.w;
+      float hh = max(st.x, 0.05);
+      u += w * wet * st.y / hh; v += w * wet * st.z / hh;
+    }
+    wetness = ww;
+    if (ww < 0.35) return vec4(bl(uHeight, uv).x - uWl - 0.08, 0.0, 0.0, 0.0);
+    return vec4(W / ww - uWl, u / ww, v / ww, F);
+  }
+  // The surface for display: a cubic B-spline over 4x4 cells (wet-weighted).
+  // The shock-capturing scheme leaves cell-scale roughness along a bore front
+  // that bilinear sampling turns into pyramids at eye level; the spline rounds
+  // it to a bump a cell wide and keeps the front where it is.
+  float engineEtaSmooth(vec2 uv, out float wetness) {
+    vec2 tc = uv * uExt / uLay.z + uLay.xy - 0.5;
+    ivec2 sz = textureSize(uState, 0);
+    ivec2 i0 = ivec2(floor(tc));
+    vec2 f = tc - vec2(i0);
+    vec2 f2 = f * f, f3 = f2 * f;
+    vec4 wx = vec4((1.0 - 3.0 * f.x + 3.0 * f2.x - f3.x), (4.0 - 6.0 * f2.x + 3.0 * f3.x), (1.0 + 3.0 * f.x + 3.0 * f2.x - 3.0 * f3.x), f3.x) / 6.0;
+    vec4 wy = vec4((1.0 - 3.0 * f.y + 3.0 * f2.y - f3.y), (4.0 - 6.0 * f2.y + 3.0 * f3.y), (1.0 + 3.0 * f.y + 3.0 * f2.y - 3.0 * f3.y), f3.y) / 6.0;
+    float W = 0.0, ww = 0.0;
+    for (int j = 0; j < 4; j++) {
+      for (int i = 0; i < 4; i++) {
+        ivec2 ij = clamp(i0 + ivec2(i - 1, j - 1), ivec2(0), sz - 1);
+        float w = wx[i] * wy[j];
+        vec4 st = texelFetch(uState, ij, 0);
+        float wet = smoothstep(0.005, 0.04, st.x);
+        W += w * wet * (texelFetch(uBathy, ij, 0).x + st.x); ww += w * wet;
+      }
+    }
+    wetness = ww;
+    if (ww < 0.35) return bl(uHeight, uv).x - uWl - 0.08;
+    return W / ww - uWl;
+  }
+  `;
 
   // --- wave pass -----------------------------------------------------------
   const quadGeo = new THREE.BufferGeometry();
@@ -192,28 +255,173 @@ export function createRenderer(canvas) {
   const waveScene = new THREE.Scene();
   waveScene.add(waveQuad);
 
+  // --- barrel mask -------------------------------------------------------------
+  // Under a thrown lip the depth-integrated solver still carries its smeared
+  // front; the breakers report the barrel voids (brk.tubes: one strip per lip
+  // sample) and this mask pulls the surface down to the trough inside them so
+  // the lip curtain forms the roof, and shades the water under the lip.
+  const MAX_TUBES = 24 * 512;
+  const maskRT = new THREE.WebGLRenderTarget(M, M, rtOpts);
+  const footGeo = new THREE.BufferGeometry();
+  const footPos = new Float32Array(MAX_TUBES * 4 * 3), footAttr = new Float32Array(MAX_TUBES * 4 * 4); // (a, eta, s, a1)
+  footGeo.setAttribute('position', new THREE.BufferAttribute(footPos, 3).setUsage(THREE.DynamicDrawUsage));
+  footGeo.setAttribute('attr', new THREE.BufferAttribute(footAttr, 4).setUsage(THREE.DynamicDrawUsage));
+  const footIdx = new Uint32Array(MAX_TUBES * 6);
+  for (let q = 0; q < MAX_TUBES; q++) {
+    const v = q * 4, k = q * 6;
+    footIdx[k] = v; footIdx[k + 1] = v + 2; footIdx[k + 2] = v + 1; footIdx[k + 3] = v + 1; footIdx[k + 4] = v + 2; footIdx[k + 5] = v + 3;
+  }
+  footGeo.setIndex(new THREE.BufferAttribute(footIdx, 1));
+  footGeo.setDrawRange(0, 0);
+  const maskMat = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    uniforms: { uExt: shared.uExt },
+    vertexShader: /* glsl */ `
+      in vec3 position; in vec4 attr;
+      uniform float uExt;
+      out vec4 vA;
+      void main() { vA = attr; gl_Position = vec4(position.xz / (uExt * 0.5), 0.0, 1.0); }`,
+    fragmentShader: /* glsl */ `
+      precision highp float;
+      in vec4 vA;
+      out vec4 o;
+      void main() {
+        // a: metres ahead of the crest root inside the strip [a0, a1]: a wall at
+        // the back, soft toward the trough where the lip lands.
+        float a = vA.x, a1 = vA.w;
+        float edge = clamp((a1 - a) / 0.6, 0.0, 1.0);
+        float w = vA.z * edge;
+        float shade = vA.z * max(0.0, 1.0 - a / max(a1 * 0.8, 0.1));
+        // The target is blended with MAX against a zero clear, so the floor
+        // level (usually a trough below still water) is stored with an offset.
+        o = vec4(w, vA.y + 16.0, shade, max(w, shade * 0.999));
+      }`,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.CustomBlending,
+    blendEquation: THREE.MaxEquation,
+    blendSrc: THREE.OneFactor,
+    blendDst: THREE.OneFactor,
+  });
+  const footMesh = new THREE.Mesh(footGeo, maskMat);
+  footMesh.frustumCulled = false;
+  const maskScene = new THREE.Scene();
+  maskScene.add(footMesh);
+  // Fill the strip geometry from the breakers' tubes.
+  function updateFootprint(tubes) {
+    let q = 0;
+    for (const tb of tubes || []) {
+      if (!tb || tb.s <= 0 || q >= MAX_TUBES) continue;
+      const px = -tb.dy * tb.hw, py = tb.dx * tb.hw; // half-width along the crest
+      const bx = tb.x + tb.dx * tb.a0, by = tb.y + tb.dy * tb.a0;
+      const fx = tb.x + tb.dx * tb.a1, fy = tb.y + tb.dy * tb.a1;
+      const v = q * 4;
+      const put = (k, x, y, a) => {
+        footPos[(v + k) * 3] = x; footPos[(v + k) * 3 + 1] = 0; footPos[(v + k) * 3 + 2] = y;
+        const o = (v + k) * 4; footAttr[o] = a; footAttr[o + 1] = tb.eta; footAttr[o + 2] = tb.s; footAttr[o + 3] = tb.a1;
+      };
+      put(0, bx - px, by - py, tb.a0); put(1, bx + px, by + py, tb.a0);
+      put(2, fx - px, fy - py, tb.a1); put(3, fx + px, fy + py, tb.a1);
+      q++;
+    }
+    footGeo.setDrawRange(0, q * 6);
+    if (q === 0) return false; // no upload: ranges only clear when the buffer is uploaded
+    for (const [att, sz] of [[footGeo.attributes.position, 12], [footGeo.attributes.attr, 16]]) {
+      att.clearUpdateRanges();
+      att.addUpdateRange(0, q * sz);
+      att.needsUpdate = true;
+    }
+    return true;
+  }
+
+  // --- present pass: engine state -> the M x M wave texture ----------------
+  const presentMat = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    uniforms: { ...shared, uM: { value: M }, uMask: { value: maskRT.texture }, uSmooth: { value: 1 }, uCarve: { value: 1 } },
+    vertexShader: passVS,
+    fragmentShader: COMMON + ENGINE_GLSL + /* glsl */ `
+      uniform float uM, uSmooth, uCarve;
+      uniform sampler2D uMask;
+      out vec4 o;
+      void main() {
+        vec2 uv = (gl_FragCoord.xy - 0.5) / (uM - 1.0);
+        float wet, wetS;
+        vec4 e = engineSample(uv, wet);
+        float etaS = engineEtaSmooth(uv, wetS);
+        e.x = mix(e.x, etaS, uSmooth);
+        vec4 mk = texture(uMask, gl_FragCoord.xy / uM);
+        float eta = mix(e.x, min(e.x, mk.y - 16.0), mk.x * uCarve);
+        // Whitewater source: the breaking field, weighted by the steepness of
+        // the surface so the roller at the front of a bore is white and the
+        // water behind it only patchy (the breaking flag stays on for a while
+        // behind the front, and over the whole inner surf zone).
+        float du = 1.0 / (uM - 1.0), dm = uExt / (uM - 1.0);
+        float wq;
+        float gx = (engineSample(uv + vec2(du, 0.0), wq).x - engineSample(uv - vec2(du, 0.0), wq).x) / (2.0 * dm);
+        float gy = (engineSample(uv + vec2(0.0, du), wq).x - engineSample(uv - vec2(0.0, du), wq).x) / (2.0 * dm);
+        float front = smoothstep(0.03, 0.12, length(vec2(gx, gy)));
+        float src = smoothstep(0.15, 0.6, e.w) * (0.3 + 0.7 * front) * wet;
+        // y carries the tube shadow (the water VS ignores displacement in engine mode).
+        o = vec4(eta, mk.z, 0.0, src);
+      }`,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const presentQuad = new THREE.Mesh(quadGeo, presentMat);
+  presentQuad.frustumCulled = false;
+  const presentScene = new THREE.Scene();
+  presentScene.add(presentQuad);
+
   // --- foam pass -------------------------------------------------------------
+  const MAX_SPLATS = 48;
+  const splatArray = Array.from({ length: MAX_SPLATS }, () => new THREE.Vector4());
   const foamMat = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
-    uniforms: { ...shared, uPrev: { value: null }, uWave: { value: waveRT.texture }, uDt: { value: 0 }, uM: { value: M } },
+    uniforms: { ...shared, uPrev: { value: null }, uWave: { value: waveRT.texture }, uDt: { value: 0 }, uM: { value: M }, uSplat: { value: splatArray }, uNSplat: { value: 0 } },
     vertexShader: passVS,
-    fragmentShader: COMMON + /* glsl */ `
+    fragmentShader: COMMON + ENGINE_GLSL + /* glsl */ `
       uniform sampler2D uPrev, uWave, uBed, uDir;
       uniform float uDt, uM;
+      uniform vec4 uSplat[${MAX_SPLATS}];
+      uniform int uNSplat;
       out vec4 o;
       void main() {
         vec2 uv = (gl_FragCoord.xy - 0.5) / (uM - 1.0);
         vec2 tuv = gl_FragCoord.xy / uM;
-        vec4 d = bl(uDir, uv);
-        float h = bl(uBed, uv).x;
-        vec2 vel = d.xy * d.z;
+        vec2 vel; float h; float wetNow = 0.0;
+        if (uEngine > 0.5) {
+          float wet;
+          vec4 e = engineSample(uv, wet);
+          vel = e.yz;
+          h = wet > 0.35 ? e.x + uWl - bl(uHeight, uv).x : 0.0;
+          wetNow = h > 0.01 ? 1.0 : 0.0;
+        } else {
+          vec4 d = bl(uDir, uv);
+          h = bl(uBed, uv).x;
+          vel = d.xy * d.z;
+          wetNow = h > 0.02 ? 1.0 : 0.0;
+        }
         vec4 pf = texture(uPrev, tuv - vel * uDt / uExt);
         vec4 ps = texture(uPrev, tuv - vel * 0.12 * uDt / uExt);
+        vec4 pw = texture(uPrev, tuv);
         float src = texelFetch(uWave, ivec2(gl_FragCoord.xy), 0).w;
+        // Foam splats from the breakers (lip impacts, splash-up), in world metres.
+        vec2 wp = uv * uExt - uExt * 0.5;
+        for (int i = 0; i < ${MAX_SPLATS}; i++) {
+          if (i >= uNSplat) break;
+          vec4 sp = uSplat[i];
+          src = max(src, sp.w * (1.0 - smoothstep(sp.z * 0.5, sp.z, length(wp - sp.xy))));
+        }
         float bore = max(pf.r * exp(-uDt / 2.2), src);
-        float resid = min(1.0, ps.g * exp(-uDt / 16.0) + bore * uDt * 0.15);
+        // Residue: the real-fluid engine re-sources foam on every bore, so it
+        // accumulates less of it and loses it faster than the classic engine.
+        float gain = uEngine > 0.5 ? 0.06 : 0.15, tauR = uEngine > 0.5 ? 11.0 : 16.0;
+        float resid = min(1.0, ps.g * exp(-uDt / tauR) + bore * uDt * gain);
         if (h < 0.02) { bore = 0.0; resid *= 0.9; }
-        o = vec4(bore, resid, 0.0, 1.0);
+        // Wet sand: where water has been recently, drying out slowly.
+        float wetness = max(pw.b * exp(-uDt / 28.0), wetNow);
+        o = vec4(bore, resid, wetness, 1.0);
       }`,
     depthTest: false,
     depthWrite: false,
@@ -294,14 +502,20 @@ export function createRenderer(canvas) {
         gl_Position = projectionMatrix * viewMatrix * vec4(vP, 1.0);
       }`,
     fragmentShader: COMMON + /* glsl */ `
-      uniform float uContours;
+      uniform float uContours, uEngine;
       uniform vec4 uBrush;
+      uniform sampler2D uFoam;
       in vec3 vP; in vec3 vN; in float vRock;
       out vec4 o;
       void main() {
         vec2 p = vP.xz + uExt * 0.5;
         vec3 n = normalize(vN);
         vec3 base = bedColor(vP.y, vRock, p);
+        if (uEngine > 0.5) {
+          // Sand the swash has just left is dark and glossy.
+          float wet = texture(uFoam, p / uExt).b * smoothstep(uWl - 0.1, uWl + 0.1, vP.y);
+          base *= mix(1.0, 0.66, wet);
+        }
         float dif = max(dot(n, SUN), 0.0);
         vec3 col = base * (0.42 * vec3(0.85, 0.92, 1.0) + 0.85 * dif * vec3(1.0, 0.95, 0.86));
         if (uContours > 0.5) {
@@ -392,17 +606,19 @@ export function createRenderer(canvas) {
   };
   const waterVS = COMMON + /* glsl */ `
     uniform sampler2D uWave, uHeight;
-    uniform float uM;
-    out vec3 vP; out vec3 vN; out float vBedZ; out float vRock; out vec2 vUv; out float vEta;
+    uniform float uM, uEngine;
+    out vec3 vP; out vec3 vN; out float vBedZ; out float vRock; out vec2 vUv; out float vEta; out float vShade;
     vec3 wpos(ivec2 ij) {
       ij = clamp(ij, ivec2(0), ivec2(int(uM) - 1));
       vec4 w = texelFetch(uWave, ij, 0);
       vec2 uv = vec2(ij) / (uM - 1.0);
-      return vec3(uv.x * uExt - uExt * 0.5 + w.y, uWl + w.x, uv.y * uExt - uExt * 0.5 + w.z);
+      vec2 disp = w.yz * (1.0 - uEngine);
+      return vec3(uv.x * uExt - uExt * 0.5 + disp.x, uWl + w.x, uv.y * uExt - uExt * 0.5 + disp.y);
     }
     void main() {
       ivec2 ij = ivec2(position.xy);
       vec3 p = wpos(ij);
+      vShade = uEngine * texelFetch(uWave, clamp(ij, ivec2(0), ivec2(int(uM) - 1)), 0).y;
       vec3 n = normalize(cross(wpos(ij + ivec2(0, 1)) - wpos(ij - ivec2(0, 1)), wpos(ij + ivec2(1, 0)) - wpos(ij - ivec2(1, 0))));
       vUv = vec2(ij) / (uM - 1.0);
       vec4 hc = bl(uHeight, vUv);
@@ -416,7 +632,7 @@ export function createRenderer(canvas) {
     uniform vec3 uCam;
     uniform float uContours, uTime, uAlpha, uDebug;
     uniform vec4 uBrush;
-    in vec3 vP; in vec3 vN; in float vBedZ; in float vRock; in vec2 vUv; in float vEta;
+    in vec3 vP; in vec3 vN; in float vBedZ; in float vRock; in vec2 vUv; in float vEta; in float vShade;
     out vec4 o;
     void main() {
       float col_h = vP.y - vBedZ;
@@ -452,6 +668,8 @@ export function createRenderer(canvas) {
       float fres = 0.02 + 0.98 * pow(1.0 - max(dot(ns, v), 0.0), 5.0);
       vec3 refl = sky(reflect(-v, ns));
       vec3 c = mix(body, refl, fres);
+      // Inside a barrel the water is in the lip's shadow.
+      c *= 1.0 - 0.55 * clamp(vShade, 0.0, 1.0);
       vec3 hv = normalize(SUN + v);
       c += vec3(1.0, 0.9, 0.7) * pow(max(dot(n, hv), 0.0), 400.0) * 3.0;
       // Foam: active whitewater plus the lacy residue it leaves behind.
@@ -591,25 +809,56 @@ export function createRenderer(canvas) {
   }
 
   let simTime = 0;
+  let engine = null;
+  function setEngine(e) {
+    if (engine && engine.group) scene.remove(engine.group);
+    engine = e;
+    shared.uEngine.value = e ? 1 : 0;
+    if (e) {
+      shared.uState.value = e.textures.state;
+      shared.uBathy.value = e.textures.bathy;
+      shared.uLay.value.set(e.layout.ML, e.layout.MO, e.layout.dxs, 0);
+      if (e.group) scene.add(e.group);
+    }
+  }
   function frame(dt) {
     resize();
     controls.update();
     arrows.visible = camera.position.y > 80; // only from high up; they would sit on the horizon at eye level
     simTime += dt;
     shared.uTime.value = simTime;
-    const ph = waveMat.uniforms.uPh.value;
-    for (let m = 0; m < NCOMP; m++) {
-      let v = (phases[m] - omegas[m] * simTime) % (2 * Math.PI);
-      ph[m] = v;
+    if (engine) {
+      engine.advance(dt, { camera, viewportHeight: canvas.height });
+      shared.uState.value = engine.textures.state; // ping-pong: the current state texture
+      shared.uBathy.value = engine.textures.bathy; // also ping-pong: flips on every bed rebuild
+      if (engine.group && engine.group.parent !== scene) scene.add(engine.group);
+      const sp = engine.splats || [];
+      const n = Math.min(sp.length, MAX_SPLATS);
+      for (let i = 0; i < n; i++) splatArray[i].set(sp[i].x, sp[i].y, sp[i].r, sp[i].s);
+      foamMat.uniforms.uNSplat.value = n;
+      renderer.setRenderTarget(maskRT);
+      renderer.setClearColor(0x000000, 0);
+      renderer.clear();
+      if (engine.breakers && updateFootprint(engine.breakers.tubes)) renderer.render(maskScene, quadCam);
+      renderer.setRenderTarget(waveRT);
+      renderer.render(presentScene, quadCam);
+    } else {
+      const ph = waveMat.uniforms.uPh.value;
+      for (let m = 0; m < NCOMP; m++) {
+        let v = (phases[m] - omegas[m] * simTime) % (2 * Math.PI);
+        ph[m] = v;
+      }
+      foamMat.uniforms.uNSplat.value = 0;
+      renderer.setRenderTarget(waveRT);
+      renderer.render(waveScene, quadCam);
     }
-    renderer.setRenderTarget(waveRT);
-    renderer.render(waveScene, quadCam);
     foamMat.uniforms.uPrev.value = foamA.texture;
     foamMat.uniforms.uDt.value = Math.min(dt, 0.1);
     renderer.setRenderTarget(foamB);
     renderer.render(foamScene, quadCam);
     [foamA, foamB] = [foamB, foamA];
     waterUniforms.uFoam.value = foamA.texture;
+    shared.uFoam.value = foamA.texture;
     renderer.setRenderTarget(null);
     renderer.render(scene, camera);
   }
@@ -675,7 +924,7 @@ export function createRenderer(canvas) {
 
   return {
     renderer, camera, controls, shared, scene,
-    lookAt, setHeight, setWaves, setSwellArrow, frame, setView, gridRay,
+    lookAt, setHeight, setWaves, setSwellArrow, frame, setView, gridRay, setEngine,
     setWaterLevel: (wl) => { shared.uWl.value = wl; },
     setContours: (on) => { shared.uContours.value = on ? 1 : 0; },
     setSeeThrough: (on) => {
@@ -688,6 +937,8 @@ export function createRenderer(canvas) {
     },
     gridSize: M,
     setDebug: (v) => { waterUniforms.uDebug.value = v; },
+    setSmoothSurface: (on) => { presentMat.uniforms.uSmooth.value = on ? 1 : 0; },
+    setBarrelCarve: (on) => { presentMat.uniforms.uCarve.value = on ? 1 : 0; },
     // Test hook: elevation statistics of the current wave field.
     waveStats: () => {
       const b = new Uint16Array(M * M * 4);

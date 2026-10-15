@@ -1,6 +1,7 @@
 import { N, DX, EXT, PRESETS, generate, roughen, brush, raycast, sampleZ, encodeBeach, decodeBeach } from './terrain.js';
 import { createRenderer } from './render.js';
 import { solve, swellSpectrum } from './waves.js';
+import { loadEngine, createEngine } from './engine-driver.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('view');
@@ -14,6 +15,7 @@ let paused = false;
 let speed = 1;
 let last = null; // last solver result
 const undoStack = [];
+let engine = null, engineMods = null, engineAuto = false, engineFailed = false, bootSeq = 0;
 
 const store = {
   get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
@@ -45,6 +47,7 @@ function onSolved(res) {
   busy = false;
   last = res;
   R.setWaves(res);
+  if (engine) engine.setTargets(res, swell);
   updateVerdict(res.summary);
   if (pending) requestSolve(); else statusEl.hidden = true;
 }
@@ -96,11 +99,16 @@ function updateVerdict(s) {
 }
 
 // --- beach -----------------------------------------------------------------------
+function heightChanged(engineToo = true) {
+  R.setHeight(beach);
+  if (engine && engineToo) engine.setBeach(beach, beach.waterLevel);
+}
 function setBeach(b, keepWl) {
   beach.z = b.z; beach.rock = b.rock;
   if (!keepWl && b.waterLevel !== undefined) { beach.waterLevel = b.waterLevel; $('tide').value = b.waterLevel; }
   readTide();
-  R.setHeight(beach);
+  heightChanged();
+  if (engine) engine.reset();
   R.resetFoam();
   requestSolve();
   autosave();
@@ -110,6 +118,7 @@ function readTide() {
   const v = beach.waterLevel;
   $('o-tide').value = `${v > 0 ? '+' : ''}${v.toFixed(2)} m`;
   R.setWaterLevel(v);
+  if (engine) engine.setWaterLevel(v);
 }
 $('tide').addEventListener('input', () => {
   readTide();
@@ -127,7 +136,7 @@ function undo() {
   const s = undoStack.pop();
   if (!s) return;
   beach.z = s.z; beach.rock = s.rock;
-  R.setHeight(beach);
+  heightChanged();
   requestSolve();
   autosave();
   $('undo').disabled = undoStack.length === 0;
@@ -136,7 +145,7 @@ $('undo').addEventListener('click', undo);
 $('roughen').addEventListener('click', () => {
   pushUndo();
   roughen(beach, 0.6, (Math.random() * 1e5) | 0);
-  R.setHeight(beach);
+  heightChanged();
   requestSolve();
   autosave();
 });
@@ -258,16 +267,25 @@ $('pause').addEventListener('click', () => {
   $('pause').textContent = paused ? 'Play' : 'Pause';
 });
 // What the camera presets need to know about the current beach.
+function shoreAt(x) {
+  const i = Math.max(0, Math.min(N - 1, Math.round((x + EXT / 2) / DX)));
+  for (let j = 0; j < N; j++) if (beach.z[j * N + i] > beach.waterLevel) return j * DX - EXT / 2;
+  return (N - 1) * DX - EXT / 2;
+}
 function viewInfo() {
   const i = N >> 1;
   let jS = N - 1;
   for (let j = 0; j < N; j++) if (beach.z[j * N + i] > beach.waterLevel) { jS = j; break; }
+  const measured = engine ? engine.spot() : null;
+  if (measured) measured.shoreZ = shoreAt(measured.x);
   return {
     shoreZ: jS * DX - EXT / 2,
     breakDist: last ? last.summary.breakDist : 120,
     breakHeight: last ? 0.82 * last.summary.breakDepth : 3,
     breakDistTypical: last ? last.summary.breakDistTypical || last.summary.breakDist : 100,
-    spot: last ? last.summary.spot : null,
+    // Where the waves break: measured by the real-fluid engine when it runs,
+    // else the classic forecast.
+    spot: measured || (last ? last.summary.spot : null),
     ground: (x, z) => sampleZ(beach.z, x + EXT / 2, z + EXT / 2),
   };
 }
@@ -328,6 +346,7 @@ canvas.addEventListener('pointermove', (e) => {
 const endPaint = () => {
   if (!painting) return;
   painting = false;
+  if (engine) engine.setBeach(beach, beach.waterLevel); // the stroke's final bed (the loop rebuilds it every 4th frame)
   requestSolve();
   autosave();
 };
@@ -373,20 +392,78 @@ window.addEventListener('keydown', (e) => {
 });
 
 // --- main loop ---------------------------------------------------------------------------
-let prevT = performance.now(), probeTick = 0;
+let prevT = performance.now(), probeTick = 0, paintTick = 0;
 function loop(t) {
   const dt = Math.min(0.05, (t - prevT) / 1000);
   prevT = t;
   if (painting && paintPt) {
     brush(beach, tool, paintPt[0], paintPt[1], +radiusIn.value, +strengthIn.value, dt, flatTarget);
-    R.setHeight(beach);
+    // The engine's bed rebuild re-uploads the whole corner grid and rebases the
+    // water, so while the brush is down it runs every 4th frame (endPaint lands the last one).
+    heightChanged((paintTick++ & 3) === 0);
     R.setBrush(paintPt[0], paintPt[1], +radiusIn.value, true);
     if (t - lastSolveReq > 350) { lastSolveReq = t; requestSolve(); }
   }
   if (++probeTick % 4 === 0) updateProbe();
+  if (engine && engineAuto && last) pickTier();
   R.frame(paused ? 0 : dt * speed);
   requestAnimationFrame(loop);
 }
+
+// --- real-fluid engine -------------------------------------------------------------------
+// The engine runs the GPU Boussinesq solver (src/engine), the crest readback
+// and the breakers (src/breakers). "auto" measures the GPU once and picks the
+// finest resolution it can run at full speed; "classic" is the old linear
+// wave model.
+const coarsePointer = matchMedia('(pointer: coarse)').matches;
+function engineLabel() {
+  if (!engine) return engineFailed ? 'Classic (engine unavailable)' : 'Classic';
+  return `Real fluid · ${engine.layout.dxs} m cells`;
+}
+function startEngine(r) {
+  if (engine) { R.setEngine(null); engine.dispose(); engine = null; }
+  try {
+    engine = createEngine(R.renderer, engineMods, { r, maxStepsPerFrame: r > 1 ? 6 : 8 });
+    engine.setBeach(beach, beach.waterLevel);
+    if (last) engine.setTargets(last, swell);
+    R.setEngine(engine);
+    R.resetFoam();
+  } catch (e) {
+    console.warn('Real-fluid engine failed to start; using the classic waves.', e);
+    engine = null;
+    R.setEngine(null);
+  }
+  $('s-engine').textContent = engineLabel();
+}
+// Auto tier: try the fine grid first and keep it if a step is quick enough
+// to leave most of the frame for rendering.
+function pickTier() {
+  engineAuto = false;
+  const ms = engine.probe();
+  const budget = engine.r > 1 ? 4.5 : 9;
+  if (ms > budget && engine.r > 1) { startEngine(1); engineAuto = true; } // probe the standard tier next frame too
+  else if (ms > budget * 2 && engine.r === 1) { R.setEngine(null); engine.dispose(); engine = null; $('s-engine').textContent = 'Classic (GPU too slow)'; }
+  console.info(`engine probe: ${ms.toFixed(2)} ms/step at ${engine ? engine.layout.dxs : '-'} m`);
+}
+async function bootEngine() {
+  const seq = ++bootSeq;
+  let mode = $('engine').value;
+  if (mode === 'classic') { if (engine) { R.setEngine(null); engine.dispose(); engine = null; } $('s-engine').textContent = engineLabel(); return; }
+  if (!R.renderer.capabilities.isWebGL2) { $('s-engine').textContent = 'Classic (needs WebGL2)'; return; }
+  if (!engineMods) {
+    try { engineMods = await loadEngine(); } catch (e) { console.warn('Real-fluid engine unavailable', e); engineFailed = true; $('s-engine').textContent = engineLabel(); return; }
+    if (seq !== bootSeq) return; // the choice changed while the modules loaded; that call decides
+    mode = $('engine').value;
+    if (mode === 'classic') { $('s-engine').textContent = engineLabel(); return; }
+  }
+  if (mode === 'auto') { engineAuto = true; startEngine(coarsePointer ? 1 : 2); }
+  else startEngine(mode === 'fine' ? 2 : 1);
+}
+// A lost WebGL context comes back with empty render targets: rebuild the
+// engine (the classic path's textures are re-uploaded by three.js itself).
+canvas.addEventListener('webglcontextlost', (e) => e.preventDefault());
+canvas.addEventListener('webglcontextrestored', () => { R.resetFoam(); if (engine) startEngine(engine.r); });
+$('engine').addEventListener('change', () => { store.set('shorebreak.engine', $('engine').value); bootEngine(); });
 
 // --- boot ---------------------------------------------------------------------------------
 const savedSwell = store.get('shorebreak.swell');
@@ -403,5 +480,8 @@ renderSaved();
 let start = null;
 try { const cur = store.get('shorebreak.current'); if (cur) start = decodeBeach(cur); } catch { start = null; }
 setBeach(start || { ...generate({ ...PRESETS.crescent, seed: 7 }), waterLevel: 0 });
+const savedEngine = store.get('shorebreak.engine');
+if (savedEngine) $('engine').value = savedEngine;
+bootEngine();
 requestAnimationFrame(loop);
-window.__app = { beach, swell, R, setTool, requestSolve, viewInfo, preset: (k) => setBeach({ ...generate({ ...PRESETS[k], seed: 7 }), waterLevel: 0 }), get last() { return last; } };
+window.__app = { beach, swell, R, setTool, requestSolve, viewInfo, preset: (k) => setBeach({ ...generate({ ...PRESETS[k], seed: 7 }), waterLevel: 0 }), get last() { return last; }, get engine() { return engine; }, startEngine };

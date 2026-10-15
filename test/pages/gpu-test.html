@@ -1,0 +1,358 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>GPU solver equivalence</title>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<style>body{font:13px monospace;background:#111;color:#ddd} canvas{width:64px;height:64px}</style>
+</head>
+<body>
+<canvas id="c" width="64" height="64"></canvas>
+<pre id="log"></pre>
+<script type="module">
+import * as THREE from 'three';
+import { createGpuSolver, CREST_SLOTS } from '../../src/engine/gpu-solver.js';
+import { layout, cornerBed, cornerManning, sampleNodes } from '../../src/engine/layout.js';
+import { createSolver, relaxField, wavenumberMS, G } from '../../src/boussinesq.js';
+import { solve } from '../../src/waves.js';
+import { N, DX } from '../../src/terrain.js';
+
+const logEl = document.getElementById('log');
+const log = (s) => { logEl.textContent += s + '\n'; console.log(s); };
+const renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('c'), antialias: false, alpha: false, powerPreference: 'high-performance' });
+const corners = (nx, ny, dx, fn) => { const b = new Float32Array((nx + 1) * (ny + 1)); for (let j = 0; j <= ny; j++) for (let i = 0; i <= nx; i++) b[j * (nx + 1) + i] = fn(i * dx, j * dx, i, j); return b; };
+const maxAbs = (a) => { let m = 0; for (let i = 0; i < a.length; i++) { const v = Math.abs(a[i]); if (v > m) m = v; } return m; };
+const hasNaN = (a) => { for (let i = 0; i < a.length; i++) if (!Number.isFinite(a[i])) return true; return false; };
+
+// Max abs difference between a GPU state readback (RGBA) and the reference arrays.
+function compare(gpu, ref, nx, ny) {
+  const r = { dh: 0, dP: 0, dQ: 0, dF: 0, dFclean: 0, flips: 0, cleanCells: 0, nan: hasNaN(gpu), maxH: 0, maxP: 0, maxQ: 0, maxF: 0 };
+  const Nc = nx * ny;
+  const Fr = ref.F;
+  // "ramp" cells: within 3 cells (Chebyshev) of a cell where the reference F is strictly between 0.001 and 0.999
+  // or where the two solvers took different breaking decisions (|dF| > 0.5).
+  const mark = new Uint8Array(Nc);
+  for (let c = 0; c < Nc; c++) {
+    const f = Fr[c], g = gpu[c * 4 + 3];
+    if ((f > 1e-3 && f < 1 - 1e-3) || Math.abs(f - g) > 0.5) {
+      const i0 = c % nx, j0 = (c / nx) | 0;
+      for (let dj = -3; dj <= 3; dj++) for (let di = -3; di <= 3; di++) {
+        const i = i0 + di, j = j0 + dj;
+        if (i >= 0 && i < nx && j >= 0 && j < ny) mark[j * nx + i] = 1;
+      }
+    }
+  }
+  for (let c = 0; c < Nc; c++) {
+    const h = gpu[c * 4], P = gpu[c * 4 + 1], Q = gpu[c * 4 + 2], F = gpu[c * 4 + 3];
+    r.dh = Math.max(r.dh, Math.abs(h - ref.h[c]));
+    r.dP = Math.max(r.dP, Math.abs(P - ref.P[c]));
+    r.dQ = Math.max(r.dQ, Math.abs(Q - ref.Q[c]));
+    const dF = Math.abs(F - Fr[c]);
+    r.dF = Math.max(r.dF, dF);
+    if (dF > 0.5) r.flips++;
+    if (!mark[c]) { r.dFclean = Math.max(r.dFclean, dF); r.cleanCells++; }
+    r.maxH = Math.max(r.maxH, Math.abs(h)); r.maxP = Math.max(r.maxP, Math.abs(P)); r.maxQ = Math.max(r.maxQ, Math.abs(Q)); r.maxF = Math.max(r.maxF, F);
+  }
+  return r;
+}
+
+// Run both solvers for `steps` steps, recording the differences at checkpoints.
+function runBoth(gpu, ref, nx, ny, dt, steps, t0, checkpoints) {
+  const conv = [];
+  let t = t0;
+  for (let n = 1; n <= steps; n++) {
+    ref.step(dt);
+    gpu.step(dt, t);
+    t += dt;
+    if (checkpoints.includes(n) || n === steps) {
+      const c = compare(gpu.readState(), ref, nx, ny);
+      conv.push({ n, dh: c.dh, dP: c.dP, dQ: c.dQ, dF: c.dF });
+      if (n === steps) return { final: c, conv };
+    }
+  }
+}
+
+const cases = {};
+
+// 1. Still water over an island (reference test 1's bed): nothing may move, GPU == reference.
+cases.still = () => {
+  const nx = 48, ny = 40, dx = 2.5;
+  const bed = corners(nx, ny, dx, (x, y) => -8 + 3 * Math.sin(x / 17) * Math.cos(y / 23) + 7 * Math.exp(-((x - 60) ** 2 + (y - 50) ** 2) / 300) + 0.3 * y / 10);
+  const ref = createSolver({ nx, ny, dx, bed, wl: 0 });
+  const gpu = createGpuSolver(renderer, { grid: { nx, ny, dx, bed }, wl: 0 });
+  gpu.setPlaneTarget({ H: 0, k: 0, w: 0, c: 0 });
+  gpu.hotStart(0);
+  const init = compare(gpu.readState(), ref, nx, ny);
+  const s0 = gpu.readState();
+  const steps = 60, dt = 0.05;
+  const { final, conv } = runBoth(gpu, ref, nx, ny, dt, steps, 0, [10, 20, 40]);
+  const s1 = gpu.readState();
+  let dSelf = 0, pSelf = 0;
+  for (let c = 0; c < nx * ny; c++) { dSelf = Math.max(dSelf, Math.abs(s1[c * 4] - s0[c * 4])); pSelf = Math.max(pSelf, Math.abs(s1[c * 4 + 1]), Math.abs(s1[c * 4 + 2])); }
+  gpu.dispose();
+  return { nx, ny, dx, steps, dt, init: { dh: init.dh, dP: init.dP }, final, conv, selfDh: dSelf, selfMaxPQ: pSelf };
+};
+
+// 2. Solitary wave (a = 1 m, d = 10 m) on a flat bed, 200 cells long, walls at both ends.
+cases.solitary = () => {
+  const d = 10, a = 1.0, c = Math.sqrt(G * (d + a)), kap = Math.sqrt((3 * a) / (4 * d * d * d));
+  const nx = 200, ny = 8, dx = 1.0, x0 = 100;
+  const bed = new Float32Array((nx + 1) * (ny + 1)).fill(-d);
+  const eta = new Float64Array(nx * ny);
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) eta[j * nx + i] = a / Math.cosh(kap * ((i + 0.5) * dx - x0)) ** 2;
+  const ref = createSolver({ nx, ny, dx, bed, wl: 0, eta });
+  const P = new Float64Array(nx * ny);
+  for (let k = 0; k < nx * ny; k++) P[k] = c * eta[k] * d / (d + eta[k]);
+  ref.P.set(P);
+  const gpu = createGpuSolver(renderer, { grid: { nx, ny, dx, bed }, wl: 0 });
+  gpu.loadState(ref.h, ref.P, ref.Q, ref.F);
+  const init = compare(gpu.readState(), ref, nx, ny);
+  const dt = 0.4 * dx / (Math.sqrt(G * d) + 5), steps = 60;
+  const { final, conv } = runBoth(gpu, ref, nx, ny, dt, steps, 0, [10, 20, 40]);
+  // peak position of both
+  const e = ref.eta(); let pk = -1, ipk = 0;
+  for (let i = 0; i < nx; i++) if (e[3 * nx + i] > pk) { pk = e[3 * nx + i]; ipk = i; }
+  const st = gpu.readState(); let pkg = -1, ipkg = 0;
+  for (let i = 0; i < nx; i++) { const v = st[(3 * nx + i) * 4] - d; if (v > pkg) { pkg = v; ipkg = i; } }
+  gpu.dispose();
+  return { nx, ny, dx, steps, dt, init: { dh: init.dh, dP: init.dP }, final, conv, refPeak: { x: ipk * dx, eta: pk }, gpuPeak: { x: ipkg * dx, eta: pkg }, speedMS: maxSpeedCPU(st, nx * ny) };
+};
+
+function maxSpeedCPU(st, Nc) { let m = 0; for (let c = 0; c < Nc; c++) { const h = st[c * 4]; if (h > 1e-4) m = Math.max(m, Math.hypot(st[c * 4 + 1], st[c * 4 + 2]) / h + Math.sqrt(G * h)); } return m; }
+
+// 3. Plane beach (reference test 5), relaxation zone with the plane-wave target, hot start from the target at t0.
+cases.beach = async () => {
+  const nx = 8, ny = 480, dx = 1.25;
+  const d0 = 8, slope = 1 / 30, flat = 120;
+  const bed = corners(nx, ny, dx, (x, y) => (y < flat ? -d0 : -d0 + (y - flat) * slope));
+  const relax = relaxField(nx, ny, { offshore: 48 });
+  const H = 1.2, T = 10, w = (2 * Math.PI) / T, k = wavenumberMS(w, d0), c = w / k, tRamp = 2 * T;
+  const t0 = 3 * T;
+  const tgt = (t, etaT, PT, QT) => {
+    const ramp = Math.min(1, t / tRamp);
+    for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+      const cc = j * nx + i; const y = (j + 0.5) * dx;
+      const e = ramp * 0.5 * H * Math.cos(k * y - w * t);
+      etaT[cc] = e; PT[cc] = 0; QT[cc] = c * e;
+    }
+  };
+  const ref = createSolver({ nx, ny, dx, bed, wl: 0, relax, target: (tt, e, p, q) => tgt(t0 + tt, e, p, q), manning: 0.02 });
+  // hot start of the reference from the target at t0
+  { const e = new Float64Array(nx * ny), p = new Float64Array(nx * ny), q = new Float64Array(nx * ny); tgt(t0, e, p, q);
+    ref.reset(e);
+    for (let cc = 0; cc < nx * ny; cc++) if (ref.h[cc] > 1e-4) { ref.P[cc] = p[cc]; ref.Q[cc] = q[cc]; } }
+  const gpu = createGpuSolver(renderer, { grid: { nx, ny, dx, bed, manning: 0.02 }, relax: { offshore: 48, lateral: 0 }, wl: 0, asyncCrests: false }); // compared scan for scan, so read synchronously
+  gpu.setPlaneTarget({ H, k, w, c, tRamp });
+  gpu.hotStart(t0);
+  const init = compare(gpu.readState(), ref, nx, ny);
+  const dt = 0.03, steps = 60;
+  const { final, conv } = runBoth(gpu, ref, nx, ny, dt, steps, t0, [10, 20, 40]);
+  // breaking statistics and the crest scan check
+  const st = gpu.readState();
+  let nF1 = 0, nF0 = 0, nMid = 0; for (let cc = 0; cc < nx * ny; cc++) { const f = ref.F[cc]; if (f >= 1 - 1e-6) nF1++; else if (f <= 0) nF0++; else nMid++; }
+  const crest = crestCheck(gpu, st, nx, ny, dx, 0, 0, 0, nx, ny);
+  const vmax = gpu.maxSpeed();
+  const vmaxCPU = maxSpeedCPU(st, nx * ny);
+  // the asynchronous path: issued now, available on a later frame
+  const issued = gpu.maxSpeedIssue();
+  let vAsync = -1, asyncFrames = 0;
+  while (issued && vAsync < 0 && asyncFrames < 30) { await new Promise((r) => requestAnimationFrame(r)); asyncFrames++; vAsync = gpu.maxSpeedPoll(); }
+  gpu.dispose();
+  return { nx, ny, dx, steps, dt, t0, init: { dh: init.dh, dP: init.dP, dQ: init.dQ }, final, conv, refF: { ones: nF1, zeros: nF0, mid: nMid }, crest, maxSpeed: { gpu: vmax, cpu: vmaxCPU, issued, async: vAsync, asyncFrames } };
+};
+
+// CPU version of the crest scan (section 5) on a state readback, compared with readCrests().
+function crestScanCPU(st, bathy, nx, ny, dx, wl, ML, MO, cols, V, K) {
+  const out = new Float32Array(cols * K * 8).fill(0);
+  for (let col = 0; col < cols; col++) for (let s = 0; s < K; s++) out[(col * K + s) * 8] = -1;
+  const cl = (j) => Math.min(ny - 1, Math.max(0, j));
+  for (let col = 0; col < cols; col++) {
+    const I = ML + col;
+    const eta = (J) => { const c = cl(J) * nx + I; const h = st[c * 4]; return h > 0.15 ? h + bathy[c * 4] - wl : -1e9; };
+    const recs = [];
+    let ePrev2 = eta(MO - 2), ePrev = eta(MO - 1), wetPrev = st[(cl(MO - 1) * nx + I) * 4] > 0.15, risingPrev = wetPrev && ePrev > ePrev2;
+    let have = false, jc = -1, jS = -1, etaC = 0, minE = 0, maxS = 0, jPrev = MO - 1;
+    for (let J = MO; J <= MO + V; J++) {
+      const last = J === MO + V;
+      const wet = !last && st[(J * nx + I) * 4] > 0.15;
+      const e = wet ? eta(J) : -1e9;
+      const rising = wet && e > ePrev;
+      if (have) {
+        if (wet) { minE = Math.min(minE, e); const sl = (ePrev - e) / dx; if (sl > maxS) { maxS = sl; jS = jPrev; } }
+        if (!wet || rising) { if (etaC - minE >= 0.08) recs.push({ jc, etaC, minE, jS, maxS }); have = false; }
+      }
+      if (!have && wetPrev && risingPrev && !rising) { have = true; jc = jPrev; etaC = ePrev; minE = wet ? e : ePrev; maxS = wet ? (ePrev - e) / dx : 0; jS = jPrev; }
+      ePrev = e; risingPrev = rising; wetPrev = wet; jPrev = J;
+    }
+    for (let s = 0; s < Math.min(K, recs.length); s++) {
+      const r = recs[s], c = r.jc * nx + I, o = (col * K + s) * 8;
+      out[o] = r.jc; out[o + 1] = r.etaC; out[o + 2] = st[c * 4]; out[o + 3] = st[c * 4 + 3];
+      out[o + 4] = r.minE; out[o + 5] = r.jS; out[o + 6] = r.maxS; out[o + 7] = st[c * 4 + 2] / Math.max(st[c * 4], 1e-6);
+    }
+  }
+  return out;
+}
+function crestCheck(gpu, st, nx, ny, dx, wl, ML, MO, cols, V) {
+  const K = CREST_SLOTS;
+  const bathy = gpu.readField('bathy');
+  const cpu = crestScanCPU(st, bathy, nx, ny, dx, wl, ML, MO, cols, V, K);
+  const g = gpu.readCrests();
+  let maxD = 0, nRec = 0, nRecCpu = 0, mismatch = 0;
+  for (let col = 0; col < cols; col++) for (let s = 0; s < K; s++) {
+    const o = (col * K + s) * 8;
+    if (g[o] >= 0) nRec++;
+    if (cpu[o] >= 0) nRecCpu++;
+    if ((g[o] >= 0) !== (cpu[o] >= 0)) { mismatch++; continue; }
+    if (g[o] < 0) continue;
+    for (let ch = 0; ch < 8; ch++) maxD = Math.max(maxD, Math.abs(g[o + ch] - cpu[o + ch]));
+  }
+  const sample = [];
+  for (let s = 0; s < K; s++) { const o = (0 * K + s) * 8; if (g[o] >= 0) sample.push(Array.from(g.slice(o, o + 8)).map((v) => +v.toFixed(4))); }
+  return { records: nRec, recordsCpu: nRecCpu, slotMismatch: mismatch, maxDiff: maxD, column0: sample };
+}
+
+// 3b. Bathymetry update (setBed / setBathymetry rebase): the water surface is kept where the cell stays wet,
+// momentum is zeroed where it becomes dry, dry land dug below the still water level floods to it.
+cases.rebase = () => {
+  const nx = 32, ny = 24, dx = 2.5, wl = 0.3;
+  const bed0 = corners(nx, ny, dx, (x, y) => -6 + 0.12 * y);
+  const gpu = createGpuSolver(renderer, { grid: { nx, ny, dx, bed: bed0 }, wl });
+  // a wave-like surface with momentum, loaded directly
+  const h = new Float32Array(nx * ny), P = new Float32Array(nx * ny), Q = new Float32Array(nx * ny);
+  const b0 = gpu.readField('bathy');
+  for (let c = 0; c < nx * ny; c++) { const eta = 0.4 * Math.sin(c * 0.37); h[c] = Math.max(0, wl + eta - b0[c * 4]); if (h[c] > 1e-4) { P[c] = 0.5 * h[c]; Q[c] = -0.3 * h[c]; } }
+  gpu.loadState(h, P, Q, null);
+  const s0 = gpu.readState();
+  // raise a bump (dries some cells), dig a hole on dry land
+  const bed1 = corners(nx, ny, dx, (x, y) => -6 + 0.12 * y + 7.0 * Math.exp(-((x - 30) ** 2 + (y - 15) ** 2) / 60) - 3 * Math.exp(-((x - 60) ** 2 + (y - 55) ** 2) / 40));
+  gpu.setBed(bed1, 0.02);
+  const s1 = gpu.readState(), b1 = gpu.readField('bathy');
+  let dW = 0, nDry = 0, badDry = 0, nFlood = 0, dFlood = 0, bad = 0;
+  for (let c = 0; c < nx * ny; c++) {
+    const Bo = b0[c * 4], Bn = b1[c * 4], ho = s0[c * 4], hn = s1[c * 4];
+    if (ho > 1e-4) {
+      const hExp = Math.max(0, Bo + ho - Bn);
+      if (hExp > 1e-4) dW = Math.max(dW, Math.abs((Bn + hn) - (Bo + ho)), Math.abs(s1[c * 4 + 1] - s0[c * 4 + 1]));
+      else { nDry++; if (hn > 1e-4 || s1[c * 4 + 1] !== 0 || s1[c * 4 + 2] !== 0) badDry++; }
+    } else {
+      const hExp = Math.max(0, wl - Bn);
+      if (hExp > 1e-4) { nFlood++; dFlood = Math.max(dFlood, Math.abs(hn - hExp)); if (s1[c * 4 + 1] !== 0) bad++; }
+      else if (hn !== 0) bad++;
+    }
+  }
+  gpu.dispose();
+  return { surfaceKept: dW, driedCells: nDry, badDry, floodedCells: nFlood, floodErr: dFlood, bad };
+};
+
+// 4. Target field on the real layout (r = 1), flat bed: GPU target vs the CPU component sum (bilinear on the node grid).
+cases.target = () => {
+  const r = 1, lay = layout(r);
+  const z = new Float32Array(N * N).fill(-10), rock = new Float32Array(N * N);
+  const beach = { z, rock };
+  const swell = { height: 1.8, period: 13, direction: 15, distanceKm: 2000 };
+  const res = solve({ N, dx: DX, z, wl: 0, swell });
+  const gpu = createGpuSolver(renderer, { r });
+  gpu.setBathymetry(beach, 0);
+  const out = {};
+  // k on the node grid, as the solver computes it
+  const grad = (S) => { const kx = new Float64Array(N * N), ky = new Float64Array(N * N); for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) { const c = j * N + i; const gx = i === 0 ? S[c + 1] - S[c] : i === N - 1 ? S[c] - S[c - 1] : 0.5 * (S[c + 1] - S[c - 1]); const gy = j === 0 ? S[c + N] - S[c] : j === N - 1 ? S[c] - S[c - N] : 0.5 * (S[c + N] - S[c - N]); kx[c] = gx / DX; ky[c] = gy / DX; } return [kx, ky]; };
+  for (const mode of ['single', 'all']) {
+    const R = { ...res, A: res.A.map((A, m) => (mode === 'single' && m > 0 ? new Float32Array(A.length) : A)) };
+    gpu.setTargets(R);
+    const t = 37.3;
+    gpu.hotStart(t);
+    const tg = gpu.readField('target');
+    const st = gpu.readState();
+    const ks = R.S.map(grad);
+    let dEta = 0, dP = 0, dQ = 0, dEtaVis = 0, dEtaMargin = 0, maxEta = 0, dState = 0;
+    for (let J = 0; J < lay.ny; J++) for (let I = 0; I < lay.nx; I++) {
+      const x = (I - lay.ML + 0.5) * lay.dxs, y = (J - lay.MO + 0.5) * lay.dxs;
+      const gx = x / DX, gy = y / DX;
+      const cx = Math.min(N - 1, Math.max(0, gx)), cy = Math.min(N - 1, Math.max(0, gy));
+      const ddx = (gx - cx) * DX, ddy = (gy - cy) * DX;
+      const D = sampleNodes(R.D, cx, cy), tau = sampleNodes(R.tau, cx, cy);
+      const env = D * (1 + R.setDepth * Math.cos(R.setOmega * (t - tau)));
+      let eta = 0, P = 0, Q = 0;
+      for (let m = 0; m < 8; m++) {
+        const S = sampleNodes(R.S[m], cx, cy), A = sampleNodes(R.A[m], cx, cy);
+        const kx = sampleNodes(ks[m][0], cx, cy), ky = sampleNodes(ks[m][1], cx, cy), kk = Math.hypot(kx, ky);
+        const e = env * A * Math.cos(S + kx * ddx + ky * ddy + R.phases[m] - R.omegas[m] * t);
+        eta += e;
+        if (kk > 1e-7) { const cm = R.omegas[m] / kk; P += e * cm * kx / kk; Q += e * cm * ky / kk; }
+      }
+      const c = J * lay.nx + I;
+      const de = Math.abs(tg[c * 4] - eta);
+      dEta = Math.max(dEta, de); dP = Math.max(dP, Math.abs(tg[c * 4 + 1] - P)); dQ = Math.max(dQ, Math.abs(tg[c * 4 + 2] - Q));
+      const inside = gx >= 0 && gx <= N - 1 && gy >= 0 && gy <= N - 1;
+      if (inside) dEtaVis = Math.max(dEtaVis, de); else dEtaMargin = Math.max(dEtaMargin, de);
+      maxEta = Math.max(maxEta, Math.abs(eta));
+      // hot start: h = wl + eta - B = 10 + eta on the flat bed
+      dState = Math.max(dState, Math.abs(st[c * 4] - (10 + tg[c * 4])), Math.abs(st[c * 4 + 1] - tg[c * 4 + 1]), Math.abs(st[c * 4 + 2] - tg[c * 4 + 2]));
+    }
+    out[mode] = { dEta, dEtaVisible: dEtaVis, dEtaMargin, dP, dQ, maxEta, hotStartDiff: dState };
+  }
+  // one step of the real layout to make sure the full pass sequence runs (no NaN)
+  const t1 = performance.now();
+  gpu.step(0.04, 37.3);
+  const st = gpu.readState();
+  out.stepMs = performance.now() - t1;
+  out.stepNaN = hasNaN(st);
+  out.maxSpeedAfterStep = gpu.maxSpeed();
+  out.passesPerStep = gpu.passesPerStep;
+  out.layout = lay;
+  gpu.dispose();
+  return out;
+};
+
+// 5. Bench: the real layout at r = 1, a 1:37.5 plane beach from 16 m depth with a sand bar, one-component hot start, 50 steps.
+cases.bench = (opts = {}) => {
+  const r = opts.r ?? 1, steps = opts.steps ?? 50;
+  const z = new Float32Array(N * N), rock = new Float32Array(N * N);
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const y = j * DX;
+    let zz = -16 + (16 / 600) * y; // shoreline at y = 600 m
+    zz += 1.5 * Math.exp(-(((y - 450) / 25) ** 2)); // sand bar, crest 1.5 m above the slope (depth 2.5 m)
+    z[j * N + i] = zz;
+  }
+  const beach = { z, rock };
+  const swell = { height: 1.8, period: 13, direction: 15, distanceKm: 2000 };
+  const tSolve = performance.now();
+  const res = solve({ N, dx: DX, z, wl: 0, swell });
+  const solveMs = performance.now() - tSolve;
+  const R = { ...res, A: res.A.map((A, m) => (m > 0 ? new Float32Array(A.length) : A)) };
+  const gpu = createGpuSolver(renderer, { r });
+  gpu.setBathymetry(beach, 0);
+  gpu.setTargets(R);
+  gpu.hotStart(0);
+  const amax = Math.sqrt(G * (16 + swell.height)) + 2;
+  const dt = 0.25 * gpu.dx / amax;
+  // warm up (compiles the programs) and sync
+  gpu.step(dt, 0); gpu.maxSpeed();
+  const t0 = performance.now();
+  let t = dt;
+  for (let n = 0; n < steps; n++) { gpu.step(dt, t); t += dt; }
+  const vmax = gpu.maxSpeed(); // forces a sync
+  const ms = (performance.now() - t0) / steps;
+  const st = gpu.readState();
+  let hmax = 0, nWet = 0; for (let c = 0; c < gpu.nx * gpu.ny; c++) { hmax = Math.max(hmax, st[c * 4]); if (st[c * 4] > 1e-4) nWet++; }
+  const tc = performance.now(); const crests = gpu.readCrests(); const crestMs = performance.now() - tc;
+  let nCrest = 0; for (let i = 0; i < crests.length; i += 8) if (crests[i] >= 0) nCrest++;
+  const mem = gpu.textureMemoryMB();
+  const out = { r, nx: gpu.nx, ny: gpu.ny, dt, steps, msPerStep: ms, passesPerStep: gpu.passesPerStep, pcrLevels: gpu.levels, textureMB: mem, maxSpeed: vmax, nan: hasNaN(st), hMax: hmax, wetCells: nWet, crestRecords: nCrest, crestReadMs: crestMs, waveSolveMs: solveMs };
+  gpu.dispose();
+  return out;
+};
+
+window.runCase = async (name, opts) => { try { const r = await cases[name](opts); log(name + ': ' + JSON.stringify(r)); return r; } catch (e) { log(name + ' ERROR ' + (e.stack || e)); return { error: String(e.stack || e) }; } };
+window.__mods = { THREE, renderer, createGpuSolver, createSolver, relaxField, wavenumberMS, G, solve, layout, cornerBed, cornerManning, sampleNodes, N, DX, corners };
+window.__ready = true;
+const q = new URLSearchParams(location.search).get('case');
+if (q) (async () => { const out = {}; for (const name of q.split(',')) out[name] = await window.runCase(name); window.__out = out; })();
+</script>
+</body>
+</html>

@@ -1,0 +1,217 @@
+// The real-fluid engine: drives the GPU Boussinesq solver, reads the crest
+// scan back every frame and feeds the breakers (plunging lips, spray, foam
+// splats). Owns the simulation clock: the solver advances in fixed steps and
+// the clock follows wall time while the GPU keeps up; when it cannot, time
+// slows down instead of the frame rate collapsing.
+import { G } from './waves.js';
+
+// Loads the engine modules; rejects where they are missing or the browser
+// cannot run them, so the app can fall back to the classic pipeline.
+export async function loadEngine() {
+  const [gpu, lay, brk] = await Promise.all([
+    import('./engine/gpu-solver.js'),
+    import('./engine/layout.js'),
+    import('./breakers/index.js'),
+  ]);
+  return { createGpuSolver: gpu.createGpuSolver, layout: lay.layout, createBreakers: brk.createBreakers };
+}
+
+const swellKey = (s) => `${s.height}|${s.period}|${s.direction}|${s.distanceKm}`;
+
+export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {}) {
+  const lay = mods.layout(r);
+  // Metre-defined breaking parameters are converted per tier so both tiers run the same physics.
+  const solver = mods.createGpuSolver(renderer, { r, breakingParams: { ramp: Math.round(7.5 / lay.dxs) } });
+  let breakers = null;
+  let beach = null, wl = 0, swell = null, targets = null, swellSig = '';
+  let t = 0;        // simulation time (s)
+  let acc = 0;      // simulated time not yet stepped
+  let dt = 0.03;    // solver time step (s)
+  let dtLimit = Infinity; // cap from the speed check (reset by a hot start)
+  let sinceBrk = 0; // simulated time since the breakers were last updated
+  let needHot = true;
+  const stats = { msStep: 0, stepsPerFrame: 0, overruns: 0, frames: 0, slow: 0 };
+  let speedCheck = 0, speedPending = false;
+  // Where the waves break, from the crest scan: per visible column the most
+  // offshore breaking crest seen lately (grid y, m) and how big it was.
+  const K = 6, CH = 8;
+  const breakY = new Float32Array(lay.V).fill(NaN), breakH = new Float32Array(lay.V), breakD = new Float32Array(lay.V);
+  const breakE = new Float32Array(lay.V); // slow average of the breaking crest height squared (the spot's score)
+  function updateBreakLine(rec, dtSim) {
+    const relax = 1.5 * dtSim; // the line creeps shoreward unless breaking renews it
+    const fade = Math.exp(-dtSim / 12);
+    const slow = Math.exp(-dtSim / 45);
+    for (let col = 0; col < lay.V; col++) {
+      let best = -1, bestEta = 0, bestH = 0;
+      for (let k = 0; k < K; k++) {
+        const o = (col * K + k) * CH;
+        const J = rec[o]; if (J < 0) break;
+        if (rec[o + 3] < 0.5) continue;
+        best = J; bestEta = rec[o + 1]; bestH = rec[o + 2]; break; // slots run offshore -> shore
+      }
+      breakH[col] *= fade;
+      breakE[col] *= slow;
+      if (best >= 0) {
+        const y = (best - lay.MO + 0.5) * lay.dxs;
+        breakY[col] = Number.isNaN(breakY[col]) ? y : Math.min(y, breakY[col] + relax);
+        breakH[col] = Math.max(breakH[col], bestEta);
+        breakE[col] += bestEta * bestEta * dtSim;
+        breakD[col] = bestH;
+      } else if (!Number.isNaN(breakY[col])) breakY[col] += relax;
+    }
+  }
+  // The alongshore column where breaking is heaviest, smoothed, as the camera
+  // presets want it: { x, breakZ (world), depth } or null while nothing breaks.
+  function spot() {
+    let bi = -1, bs = 0;
+    const w = Math.round(20 / lay.dxs);
+    // Stay 80 m clear of the side edges: the camera presets stand up to 70 m
+    // to the side of the spot, and the relaxation zones start at the edge.
+    const edge = Math.round(80 / lay.dxs);
+    const score = (c) => { let sc = 0; for (let q = -w; q <= w; q++) if (!Number.isNaN(breakY[c + q])) sc += breakE[c + q]; return sc; };
+    for (let c = Math.max(w, edge); c < lay.V - Math.max(w, edge); c++) {
+      const sc = score(c);
+      if (sc > bs) { bs = sc; bi = c; }
+    }
+    // Hysteresis: keep the current column unless another beats it clearly, so
+    // the views do not hop along the beach from set to set.
+    if (lastCol >= 0 && bi !== lastCol) {
+      const cur = score(lastCol);
+      if (cur > 0.05 && bs < cur * 1.3) { bi = lastCol; bs = cur; }
+    }
+    if (bi < 0 || bs < 0.05) return lastSpot;
+    lastCol = bi;
+    let y = 0, d = 0, m = 0;
+    for (let q = -w; q <= w; q++) { const c = bi + q; if (!Number.isNaN(breakY[c])) { y += breakY[c]; d += breakD[c]; m++; } }
+    if (!m) return lastSpot;
+    const half = lay.V * lay.dxs / 2;
+    lastSpot = { x: (bi + 0.5) * lay.dxs - half, breakZ: y / m - half, depth: d / m };
+    return lastSpot;
+  }
+  let lastSpot = null, lastCol = -1; // the spot survives the quiet spell after a swell change
+  function resetBreakLine() { breakY.fill(NaN); breakH.fill(0); breakD.fill(0); breakE.fill(0); lastSpot = null; lastCol = -1; }
+
+  function retime() {
+    if (!beach) return;
+    let dmax = 0;
+    const z = beach.z;
+    for (let c = 0; c < z.length; c++) { const d = wl - z[c]; if (d > dmax) dmax = d; }
+    const H = swell ? swell.height * 1.6 : 3;
+    const amax = Math.sqrt(G * (dmax + H)) + 2;
+    dt = Math.min(0.25 * lay.dxs / amax, dtLimit);
+  }
+
+  function setBeach(b, waterLevel) {
+    beach = b; wl = waterLevel;
+    solver.setBathymetry(b, wl);
+    if (breakers) breakers.setWaterLevel(wl);
+    retime();
+  }
+  function setWaterLevel(waterLevel) {
+    wl = waterLevel;
+    solver.setWaterLevel(wl);
+    if (breakers) breakers.setWaterLevel(wl);
+    retime();
+  }
+  function setTargets(res, sw) {
+    targets = res;
+    const sig = swellKey(sw);
+    if (sig !== swellSig) { needHot = true; swellSig = sig; resetBreakLine(); }
+    swell = { ...sw };
+    solver.setTargets(res);
+    retime();
+  }
+  function ensureBreakers() {
+    // xiSpill 0.3: the spilling/plunging boundary sits at a breaker Iribarren
+    // number of 0.3-0.5 in the literature; the lower end lets long swells on
+    // barred beaches pitch, which is what they do on the bar face.
+    if (!breakers && beach) breakers = mods.createBreakers({ layout: lay, wl, beach, swell, xiSpill: 0.3 });
+    return breakers;
+  }
+
+  // Advance the simulation by dtSim seconds of simulated time.
+  function advance(dtSim, ctx = null) {
+    if (!targets || !beach) return 0;
+    if (needHot) hotStart();
+    acc += dtSim;
+    sinceBrk += dtSim;
+    let n = Math.floor(acc / dt);
+    if (n > maxStepsPerFrame) {
+      // Overrun: the time that is dropped from the solver clock leaves the
+      // breakers' clock too, so lips, spray and crest ages advance with the water.
+      n = maxStepsPerFrame;
+      sinceBrk -= acc - n * dt;
+      acc = n * dt;
+      stats.overruns++;
+    }
+    stats.frames++;
+    const t0 = performance.now();
+    for (let k = 0; k < n; k++) { solver.step(dt, t); t += dt; }
+    acc -= n * dt;
+    if (n > 0) {
+      stats.msStep = 0.9 * stats.msStep + 0.1 * (performance.now() - t0) / n;
+      stats.stepsPerFrame = n;
+      const brk = ensureBreakers();
+      const rec = solver.readCrests();
+      // The breakers advance by the simulated time since their last update,
+      // not by this frame's slice: at 60 Hz the solver steps on fewer frames
+      // than it skips, and spray would fall in slow motion otherwise.
+      updateBreakLine(rec, sinceBrk);
+      if (brk) brk.update(rec, sinceBrk, { t, wl, beach, swell, ...(ctx || {}) });
+      sinceBrk = 0;
+      // Every few seconds make sure the time step still respects the fastest
+      // wave. The reduction is read back asynchronously (a frame or more later)
+      // so the check never drains the GPU queue inside a frame.
+      if (speedPending) {
+        const s = solver.maxSpeedPoll();
+        if (s >= 0) { speedPending = false; applySpeed(s); }
+      }
+      if ((speedCheck += dtSim) > 3) {
+        speedCheck = 0;
+        if (solver.maxSpeedIssue && solver.maxSpeedIssue()) speedPending = true;
+        else applySpeed(solver.maxSpeed());
+      }
+    }
+    return n;
+  }
+  function applySpeed(s) {
+    if (s * dt / lay.dxs > 0.4) { dtLimit = dt * 0.5; dt = dtLimit; stats.slow++; }
+  }
+  function hotStart() {
+    solver.hotStart(t);
+    needHot = false; acc = 0; dtLimit = Infinity; speedPending = false;
+    retime();
+  }
+
+  // Time one solver step (ms), forcing the GPU to finish. Used once at start
+  // to pick the resolution tier. The clock advances with the steps, as in
+  // advance(), so the interior never runs ahead of the relaxation forcing.
+  function probe(steps = 12) {
+    if (needHot) hotStart();
+    solver.step(dt, t); t += dt; solver.maxSpeed();
+    const t0 = performance.now();
+    for (let k = 0; k < steps; k++) { solver.step(dt, t); t += dt; }
+    solver.maxSpeed();
+    acc = 0;
+    return (performance.now() - t0) / steps;
+  }
+
+  // A new beach (the app sculpts in place without calling this). The old
+  // beach's wave field is dropped too: the engine idles until the forecast
+  // for the new beach arrives and hot-starts from that.
+  function reset() { needHot = true; targets = null; sinceBrk = 0; resetBreakLine(); }
+
+  return {
+    r, layout: lay, solver, stats,
+    get time() { return t; },
+    get dt() { return dt; },
+    get breakers() { return breakers; },
+    get group() { return ensureBreakers()?.group || null; },
+    get splats() { return breakers ? breakers.splats : []; },
+    get textures() { return solver.textures; },
+    setBeach, setWaterLevel, setTargets, advance, probe, reset, spot,
+    get breakLine() { return breakY; },
+    get breakEnergy() { return breakH; },
+    dispose() { solver.dispose(); if (breakers) breakers.dispose(); },
+  };
+}
