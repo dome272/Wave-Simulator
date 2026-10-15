@@ -97,7 +97,7 @@ sol.hotStart(t)                 // state := target field at time t everywhere, F
 sol.step(dt, t)                 // one SSP-RK2 step; t is the simulation time at the START of the step (for the targets)
 sol.textures.state              // THREE.Texture nx*ny RGBA32F: (h, P, Q, F)   -- read by the renderer
 sol.textures.bathy              // THREE.Texture nx*ny RGBA32F: (B, d, chiBed, n)   -- B cell bed, d = wl - B
-sol.readCrests()                // Float32Array (see section 5), synchronous readback of the crest-scan pass
+sol.readCrests()                // Float32Array (see section 5): the crest-scan pass, read back through a pixel buffer one call behind (asyncCrests: false reads synchronously)
 sol.maxSpeed()                  // number (m/s), from a reduction pass + small readback
 sol.readState()                 // Float32Array(nx*ny*4) copy of the state texture (tests only)
 sol.loadState(h, P, Q, F)       // Float64Array/Float32Array per field, nx*ny (tests only)
@@ -157,7 +157,9 @@ the whitewater source and to decide where the solver's crest is a bore.
 
 A pass with output `V x K` (K = 6 slots per visible column, `I` in
 `[ML, ML+V)`), two RGBA32F outputs, written every frame after the last
-sub-step and read back synchronously by `readCrests()` as one
+sub-step and read back by `readCrests()` (through a pixel buffer object and a
+fence, so the records describe the previous call's scan; `asyncCrests: false`
+reads synchronously) as one
 `Float32Array(V*K*8)` laid out `[(col*K + slot)*8 + channel]`, channels:
 
 ```

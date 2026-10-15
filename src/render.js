@@ -325,12 +325,14 @@ export function createRenderer(canvas) {
       put(2, fx - px, fy - py, tb.a1); put(3, fx + px, fy + py, tb.a1);
       q++;
     }
-    footGeo.attributes.position.needsUpdate = true;
-    footGeo.attributes.attr.needsUpdate = true;
-    footGeo.attributes.position.addUpdateRange(0, q * 12);
-    footGeo.attributes.attr.addUpdateRange(0, q * 16);
     footGeo.setDrawRange(0, q * 6);
-    return q > 0;
+    if (q === 0) return false; // no upload: ranges only clear when the buffer is uploaded
+    for (const [att, sz] of [[footGeo.attributes.position, 12], [footGeo.attributes.attr, 16]]) {
+      att.clearUpdateRanges();
+      att.addUpdateRange(0, q * sz);
+      att.needsUpdate = true;
+    }
+    return true;
   }
 
   // --- present pass: engine state -> the M x M wave texture ----------------
@@ -828,6 +830,7 @@ export function createRenderer(canvas) {
     if (engine) {
       engine.advance(dt, { camera, viewportHeight: canvas.height });
       shared.uState.value = engine.textures.state; // ping-pong: the current state texture
+      shared.uBathy.value = engine.textures.bathy; // also ping-pong: flips on every bed rebuild
       if (engine.group && engine.group.parent !== scene) scene.add(engine.group);
       const sp = engine.splats || [];
       const n = Math.min(sp.length, MAX_SPLATS);

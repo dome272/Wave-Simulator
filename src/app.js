@@ -15,7 +15,7 @@ let paused = false;
 let speed = 1;
 let last = null; // last solver result
 const undoStack = [];
-let engine = null, engineMods = null, engineAuto = false;
+let engine = null, engineMods = null, engineAuto = false, engineFailed = false, bootSeq = 0;
 
 const store = {
   get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch { return null; } },
@@ -414,7 +414,7 @@ function loop(t) {
 // wave model.
 const coarsePointer = matchMedia('(pointer: coarse)').matches;
 function engineLabel() {
-  if (!engine) return engineMods ? 'Classic' : 'Classic (engine unavailable)';
+  if (!engine) return engineFailed ? 'Classic (engine unavailable)' : 'Classic';
   return `Real fluid · ${engine.layout.dxs} m cells`;
 }
 function startEngine(r) {
@@ -438,20 +438,28 @@ function pickTier() {
   engineAuto = false;
   const ms = engine.probe();
   const budget = engine.r > 1 ? 4.5 : 9;
-  if (ms > budget && engine.r > 1) startEngine(1);
+  if (ms > budget && engine.r > 1) { startEngine(1); engineAuto = true; } // probe the standard tier next frame too
   else if (ms > budget * 2 && engine.r === 1) { R.setEngine(null); engine.dispose(); engine = null; $('s-engine').textContent = 'Classic (GPU too slow)'; }
   console.info(`engine probe: ${ms.toFixed(2)} ms/step at ${engine ? engine.layout.dxs : '-'} m`);
 }
 async function bootEngine() {
-  const mode = $('engine').value;
+  const seq = ++bootSeq;
+  let mode = $('engine').value;
   if (mode === 'classic') { if (engine) { R.setEngine(null); engine.dispose(); engine = null; } $('s-engine').textContent = engineLabel(); return; }
   if (!R.renderer.capabilities.isWebGL2) { $('s-engine').textContent = 'Classic (needs WebGL2)'; return; }
   if (!engineMods) {
-    try { engineMods = await loadEngine(); } catch (e) { console.warn('Real-fluid engine unavailable', e); $('s-engine').textContent = 'Classic (engine unavailable)'; return; }
+    try { engineMods = await loadEngine(); } catch (e) { console.warn('Real-fluid engine unavailable', e); engineFailed = true; $('s-engine').textContent = engineLabel(); return; }
+    if (seq !== bootSeq) return; // the choice changed while the modules loaded; that call decides
+    mode = $('engine').value;
+    if (mode === 'classic') { $('s-engine').textContent = engineLabel(); return; }
   }
   if (mode === 'auto') { engineAuto = true; startEngine(coarsePointer ? 1 : 2); }
   else startEngine(mode === 'fine' ? 2 : 1);
 }
+// A lost WebGL context comes back with empty render targets: rebuild the
+// engine (the classic path's textures are re-uploaded by three.js itself).
+canvas.addEventListener('webglcontextlost', (e) => e.preventDefault());
+canvas.addEventListener('webglcontextrestored', () => { R.resetFoam(); if (engine) startEngine(engine.r); });
 $('engine').addEventListener('change', () => { store.set('shorebreak.engine', $('engine').value); bootEngine(); });
 
 // --- boot ---------------------------------------------------------------------------------

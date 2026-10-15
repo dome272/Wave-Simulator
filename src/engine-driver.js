@@ -26,6 +26,8 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
   let t = 0;        // simulation time (s)
   let acc = 0;      // simulated time not yet stepped
   let dt = 0.03;    // solver time step (s)
+  let dtLimit = Infinity; // cap from the speed check (reset by a hot start)
+  let sinceBrk = 0; // simulated time since the breakers were last updated
   let needHot = true;
   const stats = { msStep: 0, stepsPerFrame: 0, overruns: 0, frames: 0, slow: 0 };
   let speedCheck = 0;
@@ -91,7 +93,7 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
     for (let c = 0; c < z.length; c++) { const d = wl - z[c]; if (d > dmax) dmax = d; }
     const H = swell ? swell.height * 1.6 : 3;
     const amax = Math.sqrt(G * (dmax + H)) + 2;
-    dt = 0.25 * lay.dxs / amax;
+    dt = Math.min(0.25 * lay.dxs / amax, dtLimit);
   }
 
   function setBeach(b, waterLevel) {
@@ -125,8 +127,9 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
   // Advance the simulation by dtSim seconds of simulated time.
   function advance(dtSim, ctx = null) {
     if (!targets || !beach) return 0;
-    if (needHot) { solver.hotStart(t); needHot = false; acc = 0; }
+    if (needHot) { solver.hotStart(t); needHot = false; acc = 0; dtLimit = Infinity; retime(); }
     acc += dtSim;
+    sinceBrk += dtSim;
     let n = Math.floor(acc / dt);
     if (n > maxStepsPerFrame) { n = maxStepsPerFrame; acc = n * dt; stats.overruns++; }
     stats.frames++;
@@ -138,13 +141,17 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
       stats.stepsPerFrame = n;
       const brk = ensureBreakers();
       const rec = solver.readCrests();
-      updateBreakLine(rec, dtSim);
-      if (brk) brk.update(rec, dtSim, { t, wl, beach, swell, ...(ctx || {}) });
+      // The breakers advance by the simulated time since their last update,
+      // not by this frame's slice: at 60 Hz the solver steps on fewer frames
+      // than it skips, and spray would fall in slow motion otherwise.
+      updateBreakLine(rec, sinceBrk);
+      if (brk) brk.update(rec, sinceBrk, { t, wl, beach, swell, ...(ctx || {}) });
+      sinceBrk = 0;
       // Every few seconds make sure the time step still respects the fastest wave.
       if ((speedCheck += dtSim) > 3) {
         speedCheck = 0;
         const s = solver.maxSpeed();
-        if (s * dt / lay.dxs > 0.4) { dt *= 0.5; stats.slow++; }
+        if (s * dt / lay.dxs > 0.4) { dtLimit = dt * 0.5; dt = dtLimit; stats.slow++; }
       }
     }
     return n;
@@ -161,7 +168,10 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
     return (performance.now() - t0) / steps;
   }
 
-  function reset() { needHot = true; resetBreakLine(); } // a new beach (the app sculpts in place without calling this)
+  // A new beach (the app sculpts in place without calling this). The old
+  // beach's wave field is dropped too: the engine idles until the forecast
+  // for the new beach arrives and hot-starts from that.
+  function reset() { needHot = true; targets = null; sinceBrk = 0; resetBreakLine(); }
 
   return {
     r, layout: lay, solver, stats,

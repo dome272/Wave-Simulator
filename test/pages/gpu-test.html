@@ -146,7 +146,7 @@ cases.beach = () => {
   { const e = new Float64Array(nx * ny), p = new Float64Array(nx * ny), q = new Float64Array(nx * ny); tgt(t0, e, p, q);
     ref.reset(e);
     for (let cc = 0; cc < nx * ny; cc++) if (ref.h[cc] > 1e-4) { ref.P[cc] = p[cc]; ref.Q[cc] = q[cc]; } }
-  const gpu = createGpuSolver(renderer, { grid: { nx, ny, dx, bed, manning: 0.02 }, relax: { offshore: 48, lateral: 0 }, wl: 0 });
+  const gpu = createGpuSolver(renderer, { grid: { nx, ny, dx, bed, manning: 0.02 }, relax: { offshore: 48, lateral: 0 }, wl: 0, asyncCrests: false }); // compared scan for scan, so read synchronously
   gpu.setPlaneTarget({ H, k, w, c, tRamp });
   gpu.hotStart(t0);
   const init = compare(gpu.readState(), ref, nx, ny);
