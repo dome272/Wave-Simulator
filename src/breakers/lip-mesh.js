@@ -101,12 +101,20 @@ export function createCurtainMaterial(opts = {}) {
         // Foam and aeration: streaks running down the profile, lumpy along the crest.
         // Aeration streaks run with the flow (down the profile): fine alongshore, long along v.
         float tex = 0.6 * fbm2(vec2(vUv.x * 2.3 + 0.7 * vUv.y, vUv.y * 1.4 - uTime * 0.8)) + 0.4 * fbm2(vec2(vUv.x * 0.61 + 5.0, vUv.y * 3.7 - uTime * 0.35 + vUv.x * 0.1));
-        float foam = smoothstep(0.3, 0.85, vAux.x - 0.4 * (tex - 0.5));
+        float splash = step(1.5, vAux.x); // splash-up sheets carry foam = 2
+        float foam = smoothstep(0.3, 0.85, min(vAux.x, 1.0) - 0.4 * (tex - 0.5));
         float lump = fbm2(vec2(vUv.x * 4.1, vUv.y * 5.3 - uTime * 0.6));
         vec3 fc = vec3(0.94, 0.96, 0.97) * (0.78 + 0.22 * dif) * (0.82 + 0.3 * lump);
         c = mix(c, fc, foam);
         // A thin sheet is translucent (the crest behind shows through); the thick leading edge and foam are not.
         float a = mix(0.6 + 0.3 * smoothstep(0.06, 0.3, th), 1.0, foam) * vAux.y;
+        if (splash > 0.5) {
+          // Splash-up: a burst of spray and aerated water, not a sheet. Misty,
+          // ragged, see-through, thinning toward its top (vAux.y already fades there).
+          float rag = fbm2(vec2(vUv.x * 2.7, vUv.y * 2.1 - uTime * 1.4)) * 0.7 + 0.3 * fbm2(vec2(vUv.x * 7.0 + 3.0, vUv.y * 5.0 - uTime * 2.2));
+          c = mix(c, vec3(0.90, 0.94, 0.96) * (0.8 + 0.2 * dif), 0.6);
+          a = vAux.y * smoothstep(0.2, 0.75, rag + 0.22) * 0.8;
+        }
         o = vec4(c, a);
       }`,
     transparent: true,
@@ -201,7 +209,7 @@ export function createLipMesh(opts = {}) {
       pos[vi * 3] = x + dx * la[kk]; pos[vi * 3 + 1] = ly[kk]; pos[vi * 3 + 2] = zRoot + dz * la[kk];
       nrm[vi * 3] = dx * lna[kk]; nrm[vi * 3 + 1] = lny[kk]; nrm[vi * 3 + 2] = dz * lna[kk];
       uv[vi * 2] = uAlong; uv[vi * 2 + 1] = kk / NLOOP;
-      aux[vi * 4] = Math.min(lf[kk], 1); aux[vi * 4 + 1] = alpha * lal[kk]; aux[vi * 4 + 2] = lth[kk]; aux[vi * 4 + 3] = lq[kk];
+      aux[vi * 4] = Math.min(lf[kk], 2); aux[vi * 4 + 1] = alpha * lal[kk]; aux[vi * 4 + 2] = lth[kk]; aux[vi * 4 + 3] = lq[kk];
     }
     if (slot + 1 > watermark) watermark = slot + 1;
   }

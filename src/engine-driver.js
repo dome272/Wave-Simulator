@@ -62,13 +62,16 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
       let sc = 0; for (let q = -w; q <= w; q++) if (!Number.isNaN(breakY[c + q])) sc += breakH[c + q] * breakH[c + q];
       if (sc > bs) { bs = sc; bi = c; }
     }
-    if (bi < 0 || bs < 0.05) return null;
+    if (bi < 0 || bs < 0.05) return lastSpot;
     let y = 0, d = 0, m = 0;
     for (let q = -w; q <= w; q++) { const c = bi + q; if (!Number.isNaN(breakY[c])) { y += breakY[c]; d += breakD[c]; m++; } }
-    if (!m) return null;
+    if (!m) return lastSpot;
     const half = lay.V * lay.dxs / 2;
-    return { x: (bi + 0.5) * lay.dxs - half, breakZ: y / m - half, depth: d / m };
+    lastSpot = { x: (bi + 0.5) * lay.dxs - half, breakZ: y / m - half, depth: d / m };
+    return lastSpot;
   }
+  let lastSpot = null; // the spot survives the quiet spell after a swell change
+  function resetBreakLine() { breakY.fill(NaN); breakH.fill(0); breakD.fill(0); lastSpot = null; }
 
   function retime() {
     if (!beach) return;
@@ -95,7 +98,7 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
   function setTargets(res, sw) {
     targets = res;
     const sig = swellKey(sw);
-    if (sig !== swellSig) { needHot = true; swellSig = sig; }
+    if (sig !== swellSig) { needHot = true; swellSig = sig; resetBreakLine(); }
     swell = { ...sw };
     solver.setTargets(res);
     retime();
@@ -147,7 +150,7 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
     return (performance.now() - t0) / steps;
   }
 
-  function reset() { needHot = true; }
+  function reset() { needHot = true; resetBreakLine(); } // a new beach (the app sculpts in place without calling this)
 
   return {
     r, layout: lay, solver, stats,

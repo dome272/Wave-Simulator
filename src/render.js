@@ -320,9 +320,18 @@ export function createRenderer(canvas) {
         vec4 e = engineSample(uv, wet);
         vec4 mk = texture(uMask, gl_FragCoord.xy / uM);
         float eta = mix(e.x, min(e.x, mk.y), mk.x);
-        // Whitewater source: the breaking field, strongest where the front is fresh.
+        // Whitewater source: the breaking field, weighted by the steepness of
+        // the surface so the roller at the front of a bore is white and the
+        // water behind it only patchy (the breaking flag stays on for a while
+        // behind the front, and over the whole inner surf zone).
+        float du = 1.0 / (uM - 1.0), dm = uExt / (uM - 1.0);
+        float wq;
+        float gx = (engineSample(uv + vec2(du, 0.0), wq).x - engineSample(uv - vec2(du, 0.0), wq).x) / (2.0 * dm);
+        float gy = (engineSample(uv + vec2(0.0, du), wq).x - engineSample(uv - vec2(0.0, du), wq).x) / (2.0 * dm);
+        float front = smoothstep(0.03, 0.12, length(vec2(gx, gy)));
+        float src = smoothstep(0.15, 0.6, e.w) * (0.3 + 0.7 * front) * wet;
         // y carries the tube shadow (the water VS ignores displacement in engine mode).
-        o = vec4(eta, mk.z, 0.0, smoothstep(0.15, 0.6, e.w) * wet);
+        o = vec4(eta, mk.z, 0.0, src);
       }`,
     depthTest: false,
     depthWrite: false,
@@ -373,7 +382,10 @@ export function createRenderer(canvas) {
           src = max(src, sp.w * (1.0 - smoothstep(sp.z * 0.5, sp.z, length(wp - sp.xy))));
         }
         float bore = max(pf.r * exp(-uDt / 2.2), src);
-        float resid = min(1.0, ps.g * exp(-uDt / 16.0) + bore * uDt * 0.15);
+        // Residue: the real-fluid engine re-sources foam on every bore, so it
+        // accumulates less of it and loses it faster than the classic engine.
+        float gain = uEngine > 0.5 ? 0.06 : 0.15, tauR = uEngine > 0.5 ? 11.0 : 16.0;
+        float resid = min(1.0, ps.g * exp(-uDt / tauR) + bore * uDt * gain);
         if (h < 0.02) { bore = 0.0; resid *= 0.9; }
         // Wet sand: where water has been recently, drying out slowly.
         float wetness = max(pw.b * exp(-uDt / 28.0), wetNow);

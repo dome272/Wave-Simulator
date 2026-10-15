@@ -52,7 +52,7 @@ export const DEFAULTS = {
   xiSpill: 0.4, // xi below: spilling (no lip)
   xiSurge: 2.0, // xi at or above: collapsing/surging (no lip)
   splashTime: 0.5, // s, the splash-up rises and falls within this
-  splashHeight: 0.8, // x H
+  splashHeight: 0.65, // x H
   fadeTime: 0.4, // s, the lip mesh fades after the splash-up
   maxBreakers: 24,
   maxSamples: 512, // crest samples (columns) per breaker
@@ -456,7 +456,7 @@ export function createLipModel(lay, userOpts = {}) {
     if (!(ss >= 0) || ss > o.splashTime + 0.1 || b.alpha[i] <= 0) return false;
     const H = b.H[i], c = b.c[i], e = b.taper[i];
     const f = Math.min(ss / o.splashTime, 1);
-    const rag = 0.75 + 0.5 * b.seedA[i] + 0.25 * (b.seedB[i] - 0.5); // ragged top
+    const rag = 0.85 + 0.3 * b.seedA[i]; // uneven top (the shader rags it further)
     const hs = o.splashHeight * H * Math.pow(Math.sin(Math.PI * f), 0.8) * (0.4 + 0.6 * e) * rag;
     const aBase = b.R[i] * (0.3 + 0.7 * e) + c * ss * 0.6 - 0.15 * H;
     const yBase = wl + b.etaT[i] - 0.15 * H;
@@ -466,8 +466,8 @@ export function createLipModel(lay, userOpts = {}) {
       out.a[k] = aBase + hs * (0.5 * q + 0.25 * Math.sin(Math.PI * q)) + 0.3 * H * f * q;
       out.y[k] = yBase + hs * q;
       out.th[k] = H * (0.14 * (1 - q) * (1 - q) + 0.04) * (1 + 0.4 * (b.seedB[i] - 0.5)) * (0.5 + 0.5 * e) * (0.15 + 0.85 * Math.sin(Math.PI * f));
-      out.fu[k] = 1; out.fl[k] = 1;
-      out.al[k] = 1 - 0.55 * q * q; // misty toward the top
+      out.fu[k] = 2; out.fl[k] = 2; // 2 marks a splash-up sheet for the shader
+      out.al[k] = (1 - 0.6 * q * q) * 0.8; // misty toward the top
     }
     return true;
   }
