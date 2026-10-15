@@ -48,6 +48,7 @@ export const DEFAULTS = {
   spawnFC: 0.5, // FC threshold that a column must cross upward to arm
   armWindow: 0.4, // s: an armed column must be taken by a lip within this, or it is a bore
   minStretch: 4, // m of armed crest needed to spawn a new lip
+  holeMax: 2, // columns: a hole this short between eligible columns is taken into the lip (no teeth in the ribbon)
   minH: 0.3, // m, smaller waves get no lip
   xiSpill: 0.4, // xi below: spilling (no lip)
   xiSurge: 2.0, // xi at or above: collapsing/surging (no lip)
@@ -189,6 +190,12 @@ export function createLipModel(lay, userOpts = {}) {
     return cr.age[col] >= 0 && cr.armed[col] >= 0 && t - cr.armed[col] <= o.armWindow && cr.lipped[col] < 0 && cr.type[col] === 1 && cr.H[col] >= o.minH;
   }
 
+  // A column a lip may bridge across: on the crest, not yet lipped, high enough.
+  function bridgeable(cr, col) {
+    return cr.age[col] >= 0 && cr.lipped[col] < 0 && cr.H[col] >= o.minH && Number.isFinite(cr.y[col]);
+  }
+  let elig = new Uint8Array(256);
+
   function spawn(crests, t, dt) {
     // 1. edges: arm the columns whose FC just crossed spawnFC; mark the ones born broken; re-arm the calm ones
     for (const cr of crests) {
@@ -211,17 +218,38 @@ export function createLipModel(lay, userOpts = {}) {
     }
     // 2. runs of eligible columns -> grow an adjacent lip or throw a new one
     for (const cr of crests) {
+      // Eligible columns, with short holes between them bridged: a column that
+      // armed a frame late, or whose type flickered, would otherwise cut the
+      // ribbon and leave a tooth of uncarved crest in the barrel.
+      const nc = cr.c1 - cr.c0 + 1;
+      if (elig.length < nc) elig = new Uint8Array(nc + 64);
+      for (let c = cr.c0; c <= cr.c1; c++) elig[c - cr.c0] = eligible(cr, c, t) ? 1 : 0;
+      for (let c = cr.c0; c <= cr.c1; c++) {
+        if (!elig[c - cr.c0]) continue;
+        let k = c + 1;
+        while (k <= cr.c1 && !elig[k - cr.c0] && k - c <= o.holeMax + 1 && bridgeable(cr, k)) k++;
+        if (k <= cr.c1 && k > c + 1 && elig[k - cr.c0]) for (let q = c + 1; q < k; q++) elig[q - cr.c0] = 1;
+      }
+      const isElig = (c) => c >= cr.c0 && c <= cr.c1 && elig[c - cr.c0] === 1;
       let col = cr.c0;
       while (col <= cr.c1) {
-        if (!eligible(cr, col, t)) { col++; continue; }
+        if (!isElig(col)) { col++; continue; }
         let e = col;
-        while (e + 1 <= cr.c1 && eligible(cr, e + 1, t)) e++;
+        while (isElig(e + 1)) e++;
         const run = [col, e];
         col = e + 1;
         // grow an adjacent live breaker of this crest if it still has room and is still throwing at that end
+        // (across a short hole of bridgeable columns too)
         let grown = false;
         for (const b of breakers) {
           if (b.crest !== cr || b.done || b.orphan >= 0) continue;
+          if (run[0] > b.c1 + 1 && run[0] - (b.c1 + 1) <= o.holeMax && b.phase[b.n - 1] === 0) {
+            let ok = true; for (let q = b.c1 + 1; q < run[0]; q++) if (!bridgeable(cr, q)) ok = false;
+            if (ok) run[0] = b.c1 + 1;
+          } else if (run[1] < b.c0 - 1 && (b.c0 - 1) - run[1] <= o.holeMax && b.phase[0] === 0) {
+            let ok = true; for (let q = run[1] + 1; q < b.c0; q++) if (!bridgeable(cr, q)) ok = false;
+            if (ok) run[1] = b.c0 - 1;
+          }
           if (run[0] === b.c1 + 1 && b.phase[b.n - 1] === 0) {
             const add = Math.min(run[1] - run[0] + 1, S - b.n);
             for (let q = 0; q < add; q++) launchSample(b, b.n + q, cr, run[0] + q, t);

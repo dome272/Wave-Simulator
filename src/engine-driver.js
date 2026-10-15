@@ -35,9 +35,11 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
   // offshore breaking crest seen lately (grid y, m) and how big it was.
   const K = 6, CH = 8;
   const breakY = new Float32Array(lay.V).fill(NaN), breakH = new Float32Array(lay.V), breakD = new Float32Array(lay.V);
+  const breakE = new Float32Array(lay.V); // slow average of the breaking crest height squared (the spot's score)
   function updateBreakLine(rec, dtSim) {
     const relax = 1.5 * dtSim; // the line creeps shoreward unless breaking renews it
     const fade = Math.exp(-dtSim / 12);
+    const slow = Math.exp(-dtSim / 45);
     for (let col = 0; col < lay.V; col++) {
       let best = -1, bestEta = 0, bestH = 0;
       for (let k = 0; k < K; k++) {
@@ -47,10 +49,12 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
         best = J; bestEta = rec[o + 1]; bestH = rec[o + 2]; break; // slots run offshore -> shore
       }
       breakH[col] *= fade;
+      breakE[col] *= slow;
       if (best >= 0) {
         const y = (best - lay.MO + 0.5) * lay.dxs;
         breakY[col] = Number.isNaN(breakY[col]) ? y : Math.min(y, breakY[col] + relax);
         breakH[col] = Math.max(breakH[col], bestEta);
+        breakE[col] += bestEta * bestEta * dtSim;
         breakD[col] = bestH;
       } else if (!Number.isNaN(breakY[col])) breakY[col] += relax;
     }
@@ -63,7 +67,7 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
     // Stay 80 m clear of the side edges: the camera presets stand up to 70 m
     // to the side of the spot, and the relaxation zones start at the edge.
     const edge = Math.round(80 / lay.dxs);
-    const score = (c) => { let sc = 0; for (let q = -w; q <= w; q++) if (!Number.isNaN(breakY[c + q])) sc += breakH[c + q] * breakH[c + q]; return sc; };
+    const score = (c) => { let sc = 0; for (let q = -w; q <= w; q++) if (!Number.isNaN(breakY[c + q])) sc += breakE[c + q]; return sc; };
     for (let c = Math.max(w, edge); c < lay.V - Math.max(w, edge); c++) {
       const sc = score(c);
       if (sc > bs) { bs = sc; bi = c; }
@@ -84,7 +88,7 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
     return lastSpot;
   }
   let lastSpot = null, lastCol = -1; // the spot survives the quiet spell after a swell change
-  function resetBreakLine() { breakY.fill(NaN); breakH.fill(0); breakD.fill(0); lastSpot = null; lastCol = -1; }
+  function resetBreakLine() { breakY.fill(NaN); breakH.fill(0); breakD.fill(0); breakE.fill(0); lastSpot = null; lastCol = -1; }
 
   function retime() {
     if (!beach) return;
