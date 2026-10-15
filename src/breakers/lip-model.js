@@ -288,7 +288,7 @@ export function createLipModel(lay, userOpts = {}) {
       for (let q = -3; q <= 3; q++) { const j = i + q; if (j < 0 || j >= b.n) continue; sum += b.t0s[j]; m++; }
       b.t0e[i] = Math.min(sum / m, t);
     }
-    const hw = 0.5 * dxs + 0.05;
+    const hw = 0.75 * dxs; // strips overlap their neighbours (the mask takes the max), so an oblique crest leaves no gaps
     for (let i = 0; i < b.n; i++) {
       const col = b.c0 + i;
       // root follows the tracked crest; extrapolate at c when the column is gone

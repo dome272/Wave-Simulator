@@ -292,7 +292,9 @@ export function createRenderer(canvas) {
         float edge = clamp((a1 - a) / 0.6, 0.0, 1.0);
         float w = vA.z * edge;
         float shade = vA.z * max(0.0, 1.0 - a / max(a1 * 0.8, 0.1));
-        o = vec4(w, vA.y, shade, max(w, shade * 0.999));
+        // The target is blended with MAX against a zero clear, so the floor
+        // level (usually a trough below still water) is stored with an offset.
+        o = vec4(w, vA.y + 16.0, shade, max(w, shade * 0.999));
       }`,
     transparent: true,
     depthTest: false,
@@ -334,10 +336,10 @@ export function createRenderer(canvas) {
   // --- present pass: engine state -> the M x M wave texture ----------------
   const presentMat = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
-    uniforms: { ...shared, uM: { value: M }, uMask: { value: maskRT.texture }, uSmooth: { value: 1 } },
+    uniforms: { ...shared, uM: { value: M }, uMask: { value: maskRT.texture }, uSmooth: { value: 1 }, uCarve: { value: 1 } },
     vertexShader: passVS,
     fragmentShader: COMMON + ENGINE_GLSL + /* glsl */ `
-      uniform float uM, uSmooth;
+      uniform float uM, uSmooth, uCarve;
       uniform sampler2D uMask;
       out vec4 o;
       void main() {
@@ -347,7 +349,7 @@ export function createRenderer(canvas) {
         float etaS = engineEtaSmooth(uv, wetS);
         e.x = mix(e.x, etaS, uSmooth);
         vec4 mk = texture(uMask, gl_FragCoord.xy / uM);
-        float eta = mix(e.x, min(e.x, mk.y), mk.x);
+        float eta = mix(e.x, min(e.x, mk.y - 16.0), mk.x * uCarve);
         // Whitewater source: the breaking field, weighted by the steepness of
         // the surface so the roller at the front of a bore is white and the
         // water behind it only patchy (the breaking flag stays on for a while
@@ -933,6 +935,7 @@ export function createRenderer(canvas) {
     gridSize: M,
     setDebug: (v) => { waterUniforms.uDebug.value = v; },
     setSmoothSurface: (on) => { presentMat.uniforms.uSmooth.value = on ? 1 : 0; },
+    setBarrelCarve: (on) => { presentMat.uniforms.uCarve.value = on ? 1 : 0; },
     // Test hook: elevation statistics of the current wave field.
     waveStats: () => {
       const b = new Uint16Array(M * M * 4);

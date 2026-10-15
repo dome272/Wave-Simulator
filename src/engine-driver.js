@@ -57,12 +57,23 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
   // presets want it: { x, breakZ (world), depth } or null while nothing breaks.
   function spot() {
     let bi = -1, bs = 0;
-    const w = Math.round(10 / lay.dxs);
-    for (let c = w; c < lay.V - w; c++) {
-      let sc = 0; for (let q = -w; q <= w; q++) if (!Number.isNaN(breakY[c + q])) sc += breakH[c + q] * breakH[c + q];
+    const w = Math.round(20 / lay.dxs);
+    // Stay 80 m clear of the side edges: the camera presets stand up to 70 m
+    // to the side of the spot, and the relaxation zones start at the edge.
+    const edge = Math.round(80 / lay.dxs);
+    const score = (c) => { let sc = 0; for (let q = -w; q <= w; q++) if (!Number.isNaN(breakY[c + q])) sc += breakH[c + q] * breakH[c + q]; return sc; };
+    for (let c = Math.max(w, edge); c < lay.V - Math.max(w, edge); c++) {
+      const sc = score(c);
       if (sc > bs) { bs = sc; bi = c; }
     }
+    // Hysteresis: keep the current column unless another beats it clearly, so
+    // the views do not hop along the beach from set to set.
+    if (lastCol >= 0 && bi !== lastCol) {
+      const cur = score(lastCol);
+      if (cur > 0.05 && bs < cur * 1.3) { bi = lastCol; bs = cur; }
+    }
     if (bi < 0 || bs < 0.05) return lastSpot;
+    lastCol = bi;
     let y = 0, d = 0, m = 0;
     for (let q = -w; q <= w; q++) { const c = bi + q; if (!Number.isNaN(breakY[c])) { y += breakY[c]; d += breakD[c]; m++; } }
     if (!m) return lastSpot;
@@ -70,8 +81,8 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
     lastSpot = { x: (bi + 0.5) * lay.dxs - half, breakZ: y / m - half, depth: d / m };
     return lastSpot;
   }
-  let lastSpot = null; // the spot survives the quiet spell after a swell change
-  function resetBreakLine() { breakY.fill(NaN); breakH.fill(0); breakD.fill(0); lastSpot = null; }
+  let lastSpot = null, lastCol = -1; // the spot survives the quiet spell after a swell change
+  function resetBreakLine() { breakY.fill(NaN); breakH.fill(0); breakD.fill(0); lastSpot = null; lastCol = -1; }
 
   function retime() {
     if (!beach) return;
@@ -162,6 +173,7 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
     get textures() { return solver.textures; },
     setBeach, setWaterLevel, setTargets, advance, probe, reset, spot,
     get breakLine() { return breakY; },
+    get breakEnergy() { return breakH; },
     dispose() { solver.dispose(); if (breakers) breakers.dispose(); },
   };
 }
