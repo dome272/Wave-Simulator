@@ -29,6 +29,46 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
   let needHot = true;
   const stats = { msStep: 0, stepsPerFrame: 0, overruns: 0, frames: 0, slow: 0 };
   let speedCheck = 0;
+  // Where the waves break, from the crest scan: per visible column the most
+  // offshore breaking crest seen lately (grid y, m) and how big it was.
+  const K = 6, CH = 8;
+  const breakY = new Float32Array(lay.V).fill(NaN), breakH = new Float32Array(lay.V), breakD = new Float32Array(lay.V);
+  function updateBreakLine(rec, dtSim) {
+    const relax = 1.5 * dtSim; // the line creeps shoreward unless breaking renews it
+    const fade = Math.exp(-dtSim / 12);
+    for (let col = 0; col < lay.V; col++) {
+      let best = -1, bestEta = 0, bestH = 0;
+      for (let k = 0; k < K; k++) {
+        const o = (col * K + k) * CH;
+        const J = rec[o]; if (J < 0) break;
+        if (rec[o + 3] < 0.5) continue;
+        best = J; bestEta = rec[o + 1]; bestH = rec[o + 2]; break; // slots run offshore -> shore
+      }
+      breakH[col] *= fade;
+      if (best >= 0) {
+        const y = (best - lay.MO + 0.5) * lay.dxs;
+        breakY[col] = Number.isNaN(breakY[col]) ? y : Math.min(y, breakY[col] + relax);
+        breakH[col] = Math.max(breakH[col], bestEta);
+        breakD[col] = bestH;
+      } else if (!Number.isNaN(breakY[col])) breakY[col] += relax;
+    }
+  }
+  // The alongshore column where breaking is heaviest, smoothed, as the camera
+  // presets want it: { x, breakZ (world), depth } or null while nothing breaks.
+  function spot() {
+    let bi = -1, bs = 0;
+    const w = Math.round(10 / lay.dxs);
+    for (let c = w; c < lay.V - w; c++) {
+      let sc = 0; for (let q = -w; q <= w; q++) if (!Number.isNaN(breakY[c + q])) sc += breakH[c + q] * breakH[c + q];
+      if (sc > bs) { bs = sc; bi = c; }
+    }
+    if (bi < 0 || bs < 0.05) return null;
+    let y = 0, d = 0, m = 0;
+    for (let q = -w; q <= w; q++) { const c = bi + q; if (!Number.isNaN(breakY[c])) { y += breakY[c]; d += breakD[c]; m++; } }
+    if (!m) return null;
+    const half = lay.V * lay.dxs / 2;
+    return { x: (bi + 0.5) * lay.dxs - half, breakZ: y / m - half, depth: d / m };
+  }
 
   function retime() {
     if (!beach) return;
@@ -61,7 +101,10 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
     retime();
   }
   function ensureBreakers() {
-    if (!breakers && beach) breakers = mods.createBreakers({ layout: lay, wl, beach });
+    // xiSpill 0.3: the spilling/plunging boundary sits at a breaker Iribarren
+    // number of 0.3-0.5 in the literature; the lower end lets long swells on
+    // barred beaches pitch, which is what they do on the bar face.
+    if (!breakers && beach) breakers = mods.createBreakers({ layout: lay, wl, beach, swell, xiSpill: 0.3 });
     return breakers;
   }
 
@@ -80,7 +123,9 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
       stats.msStep = 0.9 * stats.msStep + 0.1 * (performance.now() - t0) / n;
       stats.stepsPerFrame = n;
       const brk = ensureBreakers();
-      if (brk) brk.update(solver.readCrests(), dtSim, { t, wl, beach, swell, ...(ctx || {}) });
+      const rec = solver.readCrests();
+      updateBreakLine(rec, dtSim);
+      if (brk) brk.update(rec, dtSim, { t, wl, beach, swell, ...(ctx || {}) });
       // Every few seconds make sure the time step still respects the fastest wave.
       if ((speedCheck += dtSim) > 3) {
         speedCheck = 0;
@@ -112,7 +157,8 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
     get group() { return ensureBreakers()?.group || null; },
     get splats() { return breakers ? breakers.splats : []; },
     get textures() { return solver.textures; },
-    setBeach, setWaterLevel, setTargets, advance, probe, reset,
+    setBeach, setWaterLevel, setTargets, advance, probe, reset, spot,
+    get breakLine() { return breakY; },
     dispose() { solver.dispose(); if (breakers) breakers.dispose(); },
   };
 }

@@ -267,16 +267,25 @@ $('pause').addEventListener('click', () => {
   $('pause').textContent = paused ? 'Play' : 'Pause';
 });
 // What the camera presets need to know about the current beach.
+function shoreAt(x) {
+  const i = Math.max(0, Math.min(N - 1, Math.round((x + EXT / 2) / DX)));
+  for (let j = 0; j < N; j++) if (beach.z[j * N + i] > beach.waterLevel) return j * DX - EXT / 2;
+  return (N - 1) * DX - EXT / 2;
+}
 function viewInfo() {
   const i = N >> 1;
   let jS = N - 1;
   for (let j = 0; j < N; j++) if (beach.z[j * N + i] > beach.waterLevel) { jS = j; break; }
+  const measured = engine ? engine.spot() : null;
+  if (measured) measured.shoreZ = shoreAt(measured.x);
   return {
     shoreZ: jS * DX - EXT / 2,
     breakDist: last ? last.summary.breakDist : 120,
     breakHeight: last ? 0.82 * last.summary.breakDepth : 3,
     breakDistTypical: last ? last.summary.breakDistTypical || last.summary.breakDist : 100,
-    spot: last ? last.summary.spot : null,
+    // Where the waves break: measured by the real-fluid engine when it runs,
+    // else the classic forecast.
+    spot: measured || (last ? last.summary.spot : null),
     ground: (x, z) => sampleZ(beach.z, x + EXT / 2, z + EXT / 2),
   };
 }
