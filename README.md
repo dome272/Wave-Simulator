@@ -18,7 +18,7 @@ npx http-server -c-1 .
 
 three.js is loaded from jsDelivr through the import map in `index.html`.
 
-Tests: `node test/boussinesq.test.mjs` (reference solver physics), `node test/breakers.test.mjs` (crest tracker and lip model), and with the page served on port 8099 and Playwright's Chromium available, `node test/gpu-equivalence.mjs` (GPU solver against the reference) and `node test/breakers-demo.mjs` (eye-level renders of a synthetic breaking wave).
+Tests: `node test/boussinesq.test.mjs` (reference solver physics), `node test/breakers.test.mjs` (crest tracker and lip model), and with the page served on port 8099 and Playwright's Chromium available, `node test/gpu-equivalence.mjs` (GPU solver against the reference), `node test/lip-compile.mjs` (the curtain, depth pre-pass and spray shaders compile and draw) and `node test/breakers-demo.mjs` (eye-level renders of a synthetic breaking wave).
 
 ## How the waves are computed
 
