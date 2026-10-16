@@ -343,18 +343,19 @@ export function createGpuSolver(renderer, o = {}) {
     crestHave = false;
     crestOut.fill(-1);
   }
-  // Asynchronous ring: the oldest scan in flight is read once its fence has
-  // signalled (a GPU running a frame behind costs a frame of latency, not a
-  // stall), then a new scan is queued into a free slot. Only when both slots
-  // are in flight is the oldest waited for (a fence cannot be seen signalled
-  // within the task that created it, so tight loops that step many times per
-  // task, like the tests, take this path on every call).
+  // Asynchronous ring: every scan in flight whose fence has signalled is read,
+  // oldest first (the newest wins), so a GPU running a frame or two behind
+  // costs latency, not a stall, and the ring drains again once it has caught
+  // up. Only a full ring with nothing signalled is waited for (a fence cannot
+  // be seen signalled within the task that created it, so tight loops that
+  // step many times per task, like the tests, take this path on every call).
+  // Returns null when no scan completed since the last call (a dropped frame).
   function readCrests() {
     const st = begin();
     crestMat.uniforms.uState.value = stateTex(); crestMat.uniforms.uBathy.value = bathyTex();
     if (useAsync) {
       crestHave = false;
-      if (crestQueue.length && (crestQueue.length >= NRING || gl.getSyncParameter(crestFence[crestQueue[0]], gl.SYNC_STATUS) === gl.SIGNALED)) {
+      while (crestQueue.length && (crestQueue.length >= NRING || gl.getSyncParameter(crestFence[crestQueue[0]], gl.SYNC_STATUS) === gl.SIGNALED)) {
         const slot = crestQueue.shift();
         gl.deleteSync(crestFence[slot]); crestFence[slot] = null;
         gl.bindBuffer(gl.PIXEL_PACK_BUFFER, crestPBO[slot]);
@@ -379,7 +380,7 @@ export function createGpuSolver(renderer, o = {}) {
       crestHave = true;
     }
     end(st);
-    if (!crestHave) return crestOut; // nothing new yet: the last records (or none)
+    if (!crestHave) return null; // nothing new since the last call: the breakers treat it as a dropped frame
     const V = crestCols;
     for (let col = 0; col < V; col++) for (let s = 0; s < K; s++) {
       const o = (col * K + s) * 8, a = (s * V + col) * 4, b = ((K + s) * V + col) * 4;

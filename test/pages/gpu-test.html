@@ -216,6 +216,24 @@ function crestCheck(gpu, st, nx, ny, dx, wl, ML, MO, cols, V) {
   return { records: nRec, recordsCpu: nRecCpu, slotMismatch: mismatch, maxDiff: maxD, column0: sample };
 }
 
+// 3c. Crest readback ring: in a tight loop (no fence can signal within the task) the first three calls return
+// null and the fourth waits for the oldest scan; once the fences have had frames to signal, one call drains
+// the whole ring and the next call, with nothing new, returns null rather than the previous records.
+cases.ring = async () => {
+  const nx = 48, ny = 40, dx = 2.5;
+  const bed = new Float32Array((nx + 1) * (ny + 1)).fill(-5); // corner values
+  const gpu = createGpuSolver(renderer, { grid: { nx, ny, dx, bed }, wl: 0 });
+  const dt = 0.05;
+  gpu.step(dt, dt);
+  const seq = [];
+  for (let i = 0; i < 5; i++) seq.push(gpu.readCrests() === null ? 'null' : 'records');
+  for (let f = 0; f < 4; f++) await new Promise((r) => requestAnimationFrame(r));
+  const drained = gpu.readCrests() !== null;
+  const againNull = gpu.readCrests() === null;
+  gpu.dispose();
+  return { seq, drained, againNull };
+};
+
 // 3b. Bathymetry update (setBed / setBathymetry rebase): the water surface is kept where the cell stays wet,
 // momentum is zeroed where it becomes dry, dry land dug below the still water level floods to it.
 cases.rebase = () => {
@@ -340,7 +358,7 @@ cases.bench = (opts = {}) => {
   const ms = (performance.now() - t0) / steps;
   const st = gpu.readState();
   let hmax = 0, nWet = 0; for (let c = 0; c < gpu.nx * gpu.ny; c++) { hmax = Math.max(hmax, st[c * 4]); if (st[c * 4] > 1e-4) nWet++; }
-  const tc = performance.now(); const crests = gpu.readCrests(); const crestMs = performance.now() - tc;
+  const tc = performance.now(); const crests = gpu.readCrests() || new Float32Array(0); const crestMs = performance.now() - tc; // null: the ring has nothing signalled yet
   let nCrest = 0; for (let i = 0; i < crests.length; i += 8) if (crests[i] >= 0) nCrest++;
   const mem = gpu.textureMemoryMB();
   const out = { r, nx: gpu.nx, ny: gpu.ny, dt, steps, msPerStep: ms, passesPerStep: gpu.passesPerStep, pcrLevels: gpu.levels, textureMB: mem, maxSpeed: vmax, nan: hasNaN(st), hMax: hmax, wetCells: nWet, crestRecords: nCrest, crestReadMs: crestMs, waveSolveMs: solveMs };

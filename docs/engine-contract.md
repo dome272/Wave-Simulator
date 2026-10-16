@@ -100,7 +100,7 @@ sol.hotStart(t)                 // state := target field at time t everywhere, F
 sol.step(dt, t)                 // one SSP-RK2 step; t is the simulation time at the START of the step (for the targets)
 sol.textures.state              // THREE.Texture nx*ny RGBA32F: (h, P, Q, F)   -- read by the renderer
 sol.textures.bathy              // THREE.Texture nx*ny RGBA32F: (B, d, chiBed, n)   -- B cell bed, d = wl - B
-sol.readCrests()                // Float32Array (see section 5): the crest-scan pass, read back through a ring of three pixel buffers, one to three calls behind, never stalling unless all three are in flight (asyncCrests: false reads synchronously)
+sol.readCrests()                // Float32Array (see section 5) or null when no scan has completed since the last call (a dropped frame: the breakers age their crests). The scan is read back through a ring of three pixel buffers: every signalled scan is drained each call (usually two calls behind on a real GPU); only a full ring with nothing signalled is waited for (asyncCrests: false reads synchronously)
 sol.maxSpeed()                  // number (m/s), from a reduction pass + small synchronous readback
 sol.maxSpeedIssue()             // true: the reduction is queued and read back behind a fence (false: no reduction on this grid, use maxSpeed())
 sol.maxSpeedPoll()              // the issued result once the GPU has finished it (-1 until then: at least the next frame)
@@ -163,9 +163,10 @@ the whitewater source and to decide where the solver's crest is a bore.
 A pass with output `V x K` (K = 6 slots per visible column, `I` in
 `[ML, ML+V)`), two RGBA32F outputs, written every frame after the last
 sub-step and read back by `readCrests()` (through a ring of three pixel buffer
-objects behind fences, so the records describe the scan of one to three calls
-ago and the CPU never waits for the GPU unless all three are in flight;
-`asyncCrests: false` reads synchronously) as one
+objects behind fences: each call drains every scan whose fence has signalled
+and returns the newest, usually the scan of two calls ago on a real GPU, or
+null when none has completed since the last call; the CPU only waits when all
+three are in flight; `asyncCrests: false` reads synchronously) as one
 `Float32Array(V*K*8)` laid out `[(col*K + slot)*8 + channel]`, channels:
 
 ```

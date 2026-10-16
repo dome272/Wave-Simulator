@@ -12,7 +12,7 @@
 //                 crest root (x, y: world x/z) along the unit direction (dx, dy), ends a1 m ahead, and is 2 hw wide. Without
 //                 this the solver's 2-3-cell front face fills the tube: the curtain is w = H (0.65..0.95) wide and H high
 //                 (contract s6 item 4), far steeper than a bore face, so the sheet would be buried in the face below its root.
-//                 hold = 1 while the lip is in the air: the renderer keeps whitewater off the band [h0, h1] (along the
+//                 hold = the lip's alpha while it is in the air: the renderer keeps whitewater off the band [h0, h1] (along the
 //                 normal, from behind the crest to past the landing point) until the impact.
 //   brk.active    live breakers (lips), a fresh snapshot per frame: { id, crestId, state, t0, n, impact, H, xi, c, tau,
 //                 tubeWidth, throw (= tubeWidth: the tip lands that far ahead of the root), tipSpeed (world, m/s), launchZ,

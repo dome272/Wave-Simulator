@@ -368,7 +368,7 @@ export function createLipModel(lay, userOpts = {}) {
         // hold: while the lip is in the air the face under it stays green (the renderer holds the whitewater back until
         // the impact) over the whole breaking band of this sample, from behind the crest to past the landing point
         pushTube(b.x[i], b.zRoot[i], b.dirX[i], b.dirZ[i], a0, a0 + (a1 - a0) * eT, hw, b.etaT[i], clamp(s / o.tubeRamp, 0, 1) * b.alpha[i] * b.taper[i], H,
-          phase === 0 ? 1 : 0, a0 - 2 * dxs, a1 + 2 * dxs);
+          phase === 0 ? b.alpha[i] : 0, a0 - 2 * dxs, a1 + 2 * dxs); // an orphaned lip's hold fades with its curtain
       }
       // spray emitters (rates per metre of crest, scaled by the sample spacing)
       if (orphanFade > 0.2 && b.taper[i] > 0.2) {
