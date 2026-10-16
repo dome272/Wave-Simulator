@@ -326,10 +326,12 @@ export function createGpuSolver(renderer, o = {}) {
   const gl = renderer.getContext();
   const isGL2 = typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext;
   const useAsync = (o.asyncCrests ?? true) && isGL2;
-  const crestRTs = useAsync ? [crestRT, mkRT(crestCols, 2 * K)] : [crestRT];
-  const crestPBO = useAsync ? [gl.createBuffer(), gl.createBuffer()] : null;
-  const crestFence = [null, null];
-  let crestSlot = 0, crestHave = false;
+  const NRING = 3; // scans in flight at most; the CPU waits only when all are
+  const crestRTs = useAsync ? [crestRT, mkRT(crestCols, 2 * K), mkRT(crestCols, 2 * K)] : [crestRT];
+  const crestPBO = useAsync ? [gl.createBuffer(), gl.createBuffer(), gl.createBuffer()] : null;
+  const crestFence = [null, null, null];
+  const crestQueue = []; // slots with a scan in flight, oldest first
+  let crestHave = false, crestStale = 0; // scans in flight that predate a state reset: read and discarded
   if (useAsync) {
     for (const b of crestPBO) { gl.bindBuffer(gl.PIXEL_PACK_BUFFER, b); gl.bufferData(gl.PIXEL_PACK_BUFFER, crestBuf.byteLength, gl.STREAM_READ); }
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
@@ -337,37 +339,47 @@ export function createGpuSolver(renderer, o = {}) {
   // A new state (hot start, load) makes the scan in flight stale: drop it, so
   // the next call reports no crests instead of the old field's.
   function invalidateCrests() {
-    if (useAsync) for (let i = 0; i < 2; i++) if (crestFence[i]) { gl.deleteSync(crestFence[i]); crestFence[i] = null; }
+    crestStale = crestQueue.length; // consumed in order and discarded (deleting the fences would leave the buffers unread)
     crestHave = false;
     crestOut.fill(-1);
   }
+  // Asynchronous ring: the oldest scan in flight is read once its fence has
+  // signalled (a GPU running a frame behind costs a frame of latency, not a
+  // stall), then a new scan is queued into a free slot. Only when both slots
+  // are in flight is the oldest waited for (a fence cannot be seen signalled
+  // within the task that created it, so tight loops that step many times per
+  // task, like the tests, take this path on every call).
   function readCrests() {
     const st = begin();
     crestMat.uniforms.uState.value = stateTex(); crestMat.uniforms.uBathy.value = bathyTex();
-    const rt = crestRTs[crestSlot];
-    run(crestMat, rt);
     if (useAsync) {
-      const fb = renderer.properties.get(rt).__webglFramebuffer;
-      renderer.state.bindFramebuffer(gl.FRAMEBUFFER, fb);
-      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, crestPBO[crestSlot]);
-      gl.readPixels(0, 0, rt.width, rt.height, gl.RGBA, gl.FLOAT, 0);
-      crestFence[crestSlot] = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-      const prev = 1 - crestSlot;
-      if (crestFence[prev]) {
-        // A frame-old scan: normally signalled by now; if not, this waits for it.
-        gl.deleteSync(crestFence[prev]); crestFence[prev] = null;
-        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, crestPBO[prev]);
+      crestHave = false;
+      if (crestQueue.length && (crestQueue.length >= NRING || gl.getSyncParameter(crestFence[crestQueue[0]], gl.SYNC_STATUS) === gl.SIGNALED)) {
+        const slot = crestQueue.shift();
+        gl.deleteSync(crestFence[slot]); crestFence[slot] = null;
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, crestPBO[slot]);
         gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, crestBuf);
-        crestHave = true;
-      } else crestHave = false;
-      gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-      crestSlot = prev;
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        if (crestStale > 0) crestStale--; else crestHave = true;
+      }
+      if (crestQueue.length < NRING) {
+        let slot = 0; while (crestFence[slot]) slot++;
+        const rt = crestRTs[slot];
+        run(crestMat, rt);
+        renderer.state.bindFramebuffer(gl.FRAMEBUFFER, renderer.properties.get(rt).__webglFramebuffer);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, crestPBO[slot]);
+        gl.readPixels(0, 0, rt.width, rt.height, gl.RGBA, gl.FLOAT, 0);
+        crestFence[slot] = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+        crestQueue.push(slot);
+      }
     } else {
-      renderer.readRenderTargetPixels(rt, 0, 0, rt.width, rt.height, crestBuf);
+      run(crestMat, crestRT);
+      renderer.readRenderTargetPixels(crestRT, 0, 0, crestRT.width, crestRT.height, crestBuf);
       crestHave = true;
     }
     end(st);
-    if (!crestHave) return crestOut; // first call after start: last scan (or none)
+    if (!crestHave) return crestOut; // nothing new yet: the last records (or none)
     const V = crestCols;
     for (let col = 0; col < V; col++) for (let s = 0; s < K; s++) {
       const o = (col * K + s) * 8, a = (s * V + col) * 4, b = ((K + s) * V + col) * 4;
@@ -438,8 +450,8 @@ export function createGpuSolver(renderer, o = {}) {
   function dispose() {
     if (useAsync) {
       for (const b of crestPBO) gl.deleteBuffer(b);
-      for (let i = 0; i < 2; i++) if (crestFence[i]) { gl.deleteSync(crestFence[i]); crestFence[i] = null; }
-      crestRTs[1].dispose();
+      for (let i = 0; i < NRING; i++) if (crestFence[i]) { gl.deleteSync(crestFence[i]); crestFence[i] = null; }
+      for (let i = 1; i < NRING; i++) crestRTs[i].dispose();
     }
     if (speedPBO) { gl.deleteBuffer(speedPBO); if (speedFence) { gl.deleteSync(speedFence); speedFence = null; } }
     for (const t of allRT) t.dispose();

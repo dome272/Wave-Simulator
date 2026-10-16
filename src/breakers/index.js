@@ -7,11 +7,12 @@
 //                 records = Float32Array from readCrests(); null = a dropped scan frame (treated as an empty scan: the crests age)
 //   brk.group     THREE.Group: lip curtains + splash-up sheets (one mesh plus its depth pre-pass copy) and the spray points
 //   brk.splats    [{ x, y, r, s }] foam to inject this frame: x = world x, y = world z (m), r radius (m), s strength 0..1
-//   brk.tubes     [{ x, y, dx, dy, a0, a1, hw, eta, s, H }] the barrel voids this frame, one per lip sample: the present pass
+//   brk.tubes     [{ x, y, dx, dy, a0, a1, hw, eta, s, H, hold }] the barrel voids this frame, one per lip sample: the present pass
 //                 should lower the water surface to wl + eta (blended by s, 0..1) inside the strip that starts a0 m ahead of the
 //                 crest root (x, y: world x/z) along the unit direction (dx, dy), ends a1 m ahead, and is 2 hw wide. Without
 //                 this the solver's 2-3-cell front face fills the tube: the curtain is w = H (0.65..0.95) wide and H high
 //                 (contract s6 item 4), far steeper than a bore face, so the sheet would be buried in the face below its root.
+//                 hold = 1 while the lip is in the air: the renderer keeps whitewater off the strip until the impact.
 //   brk.active    live breakers (lips), a fresh snapshot per frame: { id, crestId, state, t0, n, impact, H, xi, c, tau,
 //                 tubeWidth, throw (= tubeWidth: the tip lands that far ahead of the root), tipSpeed (world, m/s), launchZ,
 //                 impactZ, x0, x1, points }  state: 'throwing' | 'splashup' | 'collapsed';
