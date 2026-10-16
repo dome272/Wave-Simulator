@@ -2,13 +2,14 @@ import { N, DX, EXT, PRESETS, generate, roughen, brush, raycast, sampleZ, encode
 import { createRenderer } from './render.js';
 import { solve, swellSpectrum } from './waves.js';
 import { loadEngine, createEngine } from './engine-driver.js';
+import { REAL_BEACHES, loadRealBeach, compass } from './real-beaches.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('view');
 const R = createRenderer(canvas);
 
 // --- state -------------------------------------------------------------------
-const beach = { z: null, rock: null, waterLevel: 0 };
+const beach = { z: null, rock: null, waterLevel: 0, real: null }; // real: name and orientation of a surveyed beach
 const swell = { height: 1.8, period: 13, direction: 15, distanceKm: 2000 };
 let tool = 'view';
 let paused = false;
@@ -56,8 +57,9 @@ function onSolved(res) {
 const distKm = (s) => Math.round(50 * Math.pow(6000 / 50, s));
 const fmtKm = (km) => (km >= 1000 ? `${(km / 1000).toFixed(1)}k km` : `${km} km`);
 function dirText(d) {
-  if (Math.abs(d) < 2) return 'straight in';
-  return `${Math.abs(d)}° from ${d > 0 ? 'left' : 'right'}`;
+  const rel = Math.abs(d) < 2 ? 'straight in' : `${Math.abs(d)}° from ${d > 0 ? 'left' : 'right'}`;
+  // On a real beach also give the compass bearing the swell comes from, as buoys report it.
+  return beach.real ? `${rel} · ${compass(beach.real.facing - d)}` : rel;
 }
 function readSwell() {
   swell.height = +$('height').value;
@@ -105,6 +107,8 @@ function heightChanged(engineToo = true) {
 }
 function setBeach(b, keepWl) {
   beach.z = b.z; beach.rock = b.rock;
+  beach.real = b.real || null;
+  showBeachInfo();
   if (!keepWl && b.waterLevel !== undefined) { beach.waterLevel = b.waterLevel; $('tide').value = b.waterLevel; }
   readTide();
   heightChanged();
@@ -128,7 +132,7 @@ $('tide').addEventListener('input', () => {
 });
 
 function pushUndo() {
-  undoStack.push({ z: beach.z.slice(), rock: beach.rock.slice() });
+  undoStack.push({ z: beach.z.slice(), rock: beach.rock.slice(), real: beach.real });
   if (undoStack.length > 25) undoStack.shift();
   $('undo').disabled = false;
 }
@@ -136,6 +140,7 @@ function undo() {
   const s = undoStack.pop();
   if (!s) return;
   beach.z = s.z; beach.rock = s.rock;
+  if (s.real !== beach.real) { beach.real = s.real; showBeachInfo(); readSwell(); }
   heightChanged();
   requestSolve();
   autosave();
@@ -196,6 +201,53 @@ $('save').addEventListener('click', () => {
   $('save').textContent = 'Saved';
   setTimeout(() => ($('save').textContent = 'Save this beach'), 1500);
 });
+
+// --- real beaches ---------------------------------------------------------------------
+function showBeachInfo() {
+  const el = $('beachInfo');
+  const r = beach.real;
+  el.hidden = !r;
+  if (!r) return;
+  const meta = REAL_BEACHES.find((x) => x.id === r.id);
+  el.innerHTML = `<b>${r.name}</b>, ${r.place}. Real seabed, facing ${compass(r.facing)}. ${meta ? meta.note : ''} ` +
+    'Water level is relative to mean sea level: a tide-table height in feet × 0.3, minus 0.9, gives metres here.';
+}
+async function loadReal(id, btn) {
+  const label = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.querySelector('span').textContent = 'Loading the seabed…'; }
+  try {
+    const data = await loadRealBeach(id);
+    const b = decodeBeach(data);
+    pushUndo();
+    setBeach(b);
+    // Start from the beach's typical swell, pointed by compass bearing.
+    const sw = data.real.swell;
+    const dir = Math.max(-70, Math.min(70, Math.round(data.real.facing - sw.bearing)));
+    $('height').value = sw.height; $('period').value = sw.period; $('direction').value = dir;
+    readSwell();
+    saveSettings();
+    requestSolve();
+    if (dlg.open) dlg.close('cancel');
+    // Stand on the sand facing the break: that is how the real place is judged.
+    setTimeout(() => R.setView('shore', viewInfo()), 50);
+  } catch (e) {
+    console.warn('Could not load the real beach', e);
+    if (btn) btn.querySelector('span').textContent = 'Could not load this beach. Try again.';
+    return;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+  if (btn) btn.innerHTML = label;
+}
+const realEl = $('realBeaches');
+for (const rb of REAL_BEACHES) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'preset';
+  b.innerHTML = `<b>${rb.name}</b><small>${rb.place}</small><span>${rb.blurb}</span>`;
+  b.addEventListener('click', () => loadReal(rb.id, b));
+  realEl.append(b);
+}
 
 // --- new beach dialog ---------------------------------------------------------------
 const dlg = $('dlg');
@@ -484,4 +536,4 @@ const savedEngine = store.get('shorebreak.engine');
 if (savedEngine) $('engine').value = savedEngine;
 bootEngine();
 requestAnimationFrame(loop);
-window.__app = { beach, swell, R, setTool, requestSolve, viewInfo, preset: (k) => setBeach({ ...generate({ ...PRESETS[k], seed: 7 }), waterLevel: 0 }), get last() { return last; }, get engine() { return engine; }, startEngine };
+window.__app = { beach, swell, R, setTool, requestSolve, viewInfo, loadReal, preset: (k) => setBeach({ ...generate({ ...PRESETS[k], seed: 7 }), waterLevel: 0 }), get last() { return last; }, get engine() { return engine; }, startEngine };
