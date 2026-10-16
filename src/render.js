@@ -996,15 +996,25 @@ export function createRenderer(canvas) {
       t = [sx - 4, y - 1.0, zt - 15];
       fov = 30;
     } else if (name === 'shore') {
-      // Standing on the sand a few steps up from the water, at eye level.
-      const zc = shoreZ + 12;
-      p = [sx, Math.max(ground(sx, zc), wl) + 1.7, zc];
-      t = [sx - 15, wl + 1.2, zt - 40];
+      // Standing on the sand a few steps up from the water, at eye level. A
+      // real beach has one sand beach to stand on (info.stand), which may not
+      // face the break straight on, so look from there toward the break.
+      const st = info && info.stand;
+      const px = st ? st.x : sx, zc = (st ? st.shoreZ : shoreZ) + 12;
+      p = [px, Math.max(ground(px, zc), wl) + 1.7, zc];
+      t = st ? [sx, wl + 1.2, zt - 25] : [sx - 15, wl + 1.2, zt - 40];
       fov = 30;
     } else if (name === 'top') {
       p = [0, 760, 1]; t = [0, 0, 0];
     } else {
       p = [-520, 290, 430]; t = [-100, -6, 10];
+    }
+    if (name === 'lineup' || name === 'impact') {
+      // Real coastlines are not straight along x: the spot can sit by a reef
+      // shelf or under a cliff, so step out to sea until the eye is over water
+      // and keep it above the ground.
+      for (let k = 0; k < 80 && ground(p[0], p[2]) > wl - 0.4; k++) { p[2] -= 4; t[2] -= 4; }
+      p[1] = Math.max(p[1], ground(p[0], p[2]) + 1.7);
     }
     camera.fov = fov;
     camera.updateProjectionMatrix();

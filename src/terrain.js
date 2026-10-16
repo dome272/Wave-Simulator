@@ -251,7 +251,9 @@ export function encodeBeach(beach) {
     zi[c] = Math.max(-32000, Math.min(32000, Math.round(beach.z[c] * 100)));
     r[c] = Math.round(beach.rock[c] * 255);
   }
-  return { v: 1, n: N, dx: DX, wl: beach.waterLevel, z: b64(new Uint8Array(zi.buffer)), rock: b64(r) };
+  const o = { v: 1, n: N, dx: DX, wl: beach.waterLevel, z: b64(new Uint8Array(zi.buffer)), rock: b64(r) };
+  if (beach.real) o.real = beach.real; // a real beach keeps its name and compass orientation
+  return o;
 }
 export function decodeBeach(o) {
   if (!o || o.n !== N) throw new Error('This beach was saved at a different grid size.');
@@ -259,7 +261,7 @@ export function decodeBeach(o) {
   const r = unb64(o.rock);
   const z = new Float32Array(N * N), rock = new Float32Array(N * N);
   for (let c = 0; c < N * N; c++) { z[c] = zi[c] / 100; rock[c] = r[c] / 255; }
-  return { z, rock, waterLevel: o.wl || 0 };
+  return { z, rock, waterLevel: o.wl || 0, real: o.real || null };
 }
 function b64(u8) {
   let s = '';

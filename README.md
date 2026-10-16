@@ -3,6 +3,7 @@
 **Shorebreak Lab** is a browser app for building a beach in 3D and watching a swell break on it.
 
 - Set the incoming swell: height, period, direction, and how far away the storm was. Height is the typical wave as it arrives offshore; waves come in sets, and the set waves run about a third bigger.
+- Load a real California beach (Davenport Landing, Lower Trestles) cut from surveyed seabed data, and set the swell by compass bearing as buoys report it.
 - Build a beach from a starting design (crescent sandbars, a long bar, a point, a reef peak, a rocky cove, or a blank slope), with adjustable steepness, bars, rocks and randomness.
 - Reshape it with sand tools (pile sand, dig, smooth, flatten, lay rock) and watch how the breaking changes.
 - Watch from the overview, from the lineup just outside the break, from the impact zone facing the waves, or standing on the sand. The eye-level views stand where the breaking is heaviest, so on a barred beach they look at a bar rather than down a rip channel.
@@ -49,3 +50,11 @@ This is a phase-resolved linear model with breaking rules on top. It is fast eno
 ## Seabed format
 
 The beach is a 256 × 256 heightfield at 2.5 m spacing (637.5 m square): bed elevation in metres relative to the still water level, plus a rock mask. Row 0 is the offshore edge and the last row is inland. Real bathymetry can be loaded into the same grid: the California cutter (16-bit PNG plus JSON sidecar with `cell_m`, `z_min_m`, `z_max_m`, north-up) needs resampling to 2.5 m, rotating so the ocean is at row 0, and shifting from NAVD88 to mean sea level.
+
+## Real beaches
+
+`beaches/<id>.json` are real seabeds in the saved-beach format, plus a `real` block (name, the compass bearing the beach faces, the typical swell it loads with, sources). `tools/cut_beach.py <id>` makes them: it reads the USGS CoNED topobathymetric model and the USACE NCMP 2014 California topobathy lidar from NOAA's public S3 mirror (both public domain), keeps the lidar where it has data and blends its difference from CoNED back to zero across its gaps, resamples to the 2.5 m grid rotated so the beach faces row 0, shifts NAVD88 to mean sea level and estimates a rock mask from bed roughness and the reef shelves.
+
+The 2014 lidar matters on rocky coasts: at Davenport Landing CoNED has no survey between the waterline and about 10 m depth and only interpolates a smooth slope there, while the lidar shows the reef shelves and the channel. Steamer Lane is left out because neither source surveyed its reef.
+
+On a real beach the swell direction slider is still degrees from straight in (+ from the left as seen from the sand); the readout adds the compass bearing it comes from: bearing = facing − direction. Water level is relative to mean sea level; a tide-table height (feet above MLLW) × 0.3 − 0.9 gives it in metres on these beaches.
