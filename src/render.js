@@ -436,7 +436,7 @@ export function createRenderer(canvas) {
         float front = smoothstep(0.03, 0.12, length(vec2(gx, gy)));
         // Under a lip still in the air the face stays green: the whitewater
         // comes with the impact (mask.w, from the breakers).
-        float open = 1.0 - mk.w;
+        float open = 1.0 - smoothstep(0.15, 0.7, mk.w); // a fairly sharp curl line, not a wide speckled one
         float src = smoothstep(0.15, 0.6, sm.y) * (0.15 + 0.85 * front) * wet * open;
         // y carries the tube shadow (the water VS ignores displacement in engine
         // mode); z the roller, the steep front of a breaking wave.
@@ -497,7 +497,7 @@ export function createRenderer(canvas) {
         src = max(src, splat); rollerSrc = max(rollerSrc, splat);
         // Under a lip in the air (mask.w) the face stays green: whitewater the
         // solver's bore lit before the lip launched is wiped until the impact.
-        float open = 1.0 - uEngine * texture(uMask, tuv).w;
+        float open = 1.0 - uEngine * smoothstep(0.15, 0.7, texture(uMask, tuv).w);
         float bore = max(pf.r * exp(-uDt / 1.7), min(src, pf.r + uDt * 3.0)) * open; // fresh foam builds up over 0.3 s
         float roller = max(pf.a * exp(-uDt / 0.45), rollerSrc) * open;
         // Residue: the real-fluid engine re-sources foam on every bore, so it
@@ -774,8 +774,8 @@ export function createRenderer(canvas) {
       float blot = gfbm(p * 0.5 + vec2(uTime * 0.12, -uTime * 0.08));
       float lump = 0.6 * gfbm(p * 1.1 + vec2(uTime * 0.3, -uTime * 0.2)) + 0.4 * gfbm(p * 0.4 + vec2(-uTime * 0.15, uTime * 0.1));
       float grain = clamp(0.5 + 1.2 * gnoise(p * 6.0 + vec2(uTime * 0.9, uTime * 0.4)), 0.0, 1.0);
-      float thr = 0.28 * mix(blot, streak, fresh) + 0.45 * lump + 0.2 * grain;
-      float act = smoothstep(0.0, 0.2, f.r * 1.15 - thr);
+      float thr = 0.32 * mix(blot, streak, fresh) + 0.5 * lump + 0.1 * grain; // patches decide where foam dissolves, grain only textures it
+      float act = smoothstep(0.0, 0.16, f.r * 1.15 - thr);
       // The roller: dense, tumbling, bright.
       float roller = smoothstep(0.1, 0.5, f.a * 1.3 - 0.35 * lump - 0.25 * grain);
       act = max(act, roller);
