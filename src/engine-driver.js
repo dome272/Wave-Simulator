@@ -152,11 +152,11 @@ export function createEngine(renderer, mods, { r = 1, maxStepsPerFrame = 8 } = {
       stats.msStep = 0.9 * stats.msStep + 0.1 * (performance.now() - t0) / n;
       stats.stepsPerFrame = n;
       const brk = ensureBreakers();
-      const rec = solver.readCrests();
+      const rec = solver.readCrests(); // null when no scan has completed since the last call
       // The breakers advance by the simulated time since their last update,
       // not by this frame's slice: at 60 Hz the solver steps on fewer frames
       // than it skips, and spray would fall in slow motion otherwise.
-      updateBreakLine(rec, sinceBrk);
+      if (rec) updateBreakLine(rec, sinceBrk);
       if (brk) brk.update(rec, sinceBrk, { t, wl, beach, swell, ...(ctx || {}) });
       sinceBrk = 0;
       // Every few seconds make sure the time step still respects the fastest

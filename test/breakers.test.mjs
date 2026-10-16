@@ -325,18 +325,24 @@ console.log('\n# 9. Curtain mesh (three.js geometry, no renderer) and the tube d
 {
   const cs = standardCase({});
   const brk = createBreakers({ layout: cs.sc.lay, wl: 0, beach: cs.beach, swell: cs.swell });
-  let mid = null, atImpact = null, tubeSpawn = null, tubeMid = null, tubeFrames = 0, tubeBad = 0;
+  let mid = null, atImpact = null, tubeSpawn = null, tubeMid = null, tubeFrames = 0, tubeBad = 0, holdBad = 0, tubeAtImpact = null;
   for (let f = 0, t = 0; f < 100; f++, t += DT) {
     brk.update(cs.sc.records(t), DT, { t, swell: cs.swell });
     const a = brk.active[0];
     if (a && !tubeSpawn) tubeSpawn = brk.tubes.map((tb) => ({ ...tb }));
     if (a && !mid && a.points[120].p >= 0.5) { mid = snapshot(brk, 120); tubeMid = { ...brk.tubes[120] }; }
-    if (a && !atImpact && a.state === 'splashup') atImpact = snapshot(brk, 120);
+    if (a && !atImpact && a.state === 'splashup') { atImpact = snapshot(brk, 120); tubeAtImpact = { ...brk.tubes[120] }; }
     if (a) {
       tubeFrames++;
       const n = brk.model.breakers.reduce((s, b) => s + b.n, 0);
       if (brk.tubes.length !== n) tubeBad++;
       for (const tb of brk.tubes) if (!(tb.a0 >= 0 && tb.a1 > tb.a0 && tb.hw > 0 && tb.s >= 0 && tb.s <= 1 && Number.isFinite(tb.eta))) tubeBad++;
+      // the hold: the lip's alpha while it is in the air, over a band from 2 cells behind the root to 2 cells past the landing point
+      const b0 = brk.model.breakers[0], dxs = cs.sc.lay.dxs;
+      brk.tubes.forEach((tb, k) => {
+        const want = b0.phase[k] === 0 ? b0.alpha[k] : 0;
+        if (!(Math.abs(tb.hold - want) < 1e-9 && Math.abs(tb.h0 - (tb.a0 - 2 * dxs)) < 1e-6 && tb.h1 > tb.a1 && tb.h1 >= b0.w[k] + 0.5 * b0.H[k] + 2 * dxs - 1e-6)) holdBad++;
+      });
     }
   }
   function snapshot(brk, col) {
@@ -360,6 +366,7 @@ console.log('\n# 9. Curtain mesh (three.js geometry, no renderer) and the tube d
   check('mid-throw: the curtain reaches the tip position of the model (profile = trajectory family)', mid && Math.abs(mid.zmax - mid.tipZ) < 0.25 && mid.ymin < mid.tipY + 0.05, mid ? `mesh z max ${f2(mid.zmax)} vs tip z ${f2(mid.tipZ)} (root ${f2(mid.rootZ)}), p = ${f2(mid.p)}` : '');
   check('at impact the splash-up sheet is added (second ribbon), the leading edge goes white and the sheet near the crest stays water', atImpact && atImpact.splashSlots === atImpact.n && atImpact.idx === 2 * (atImpact.n - 1) * NLOOP * 6 && atImpact.foamTip >= 0.9 && atImpact.foamUpRoot < 0.3, atImpact ? `splash slots ${atImpact.splashSlots}, indices ${atImpact.idx}, tip foam ${f2(atImpact.foamTip)}, upper-face foam near the root ${f2(atImpact.foamUpRoot)}` : '');
   const tb0 = tubeSpawn && tubeSpawn[120];
+  check('brk.tubes: hold = alpha in the air (1 at spawn, 0 at impact) over [a0 - 2 dxs, past the landing point]', holdBad === 0 && tb0 && tb0.hold === 1 && atImpact && tubeAtImpact && tubeAtImpact.hold === 0, `bad hold entries ${holdBad}; col 120 hold at spawn ${tb0 && tb0.hold}, at impact ${tubeAtImpact && tubeAtImpact.hold}, band ${f2(tb0 && tb0.h0)}..${f2(tb0 && tb0.h1)} m`);
   check('brk.tubes: one void strip per lip sample, from 0.1 w ahead of the root to past the face toe, floor at etaT, blended in over 0.15 s', tubeBad === 0 && tubeFrames > 0 && tb0 && Math.abs(tb0.a0 - 0.1 * mid.w) < 1e-3 && tb0.a1 >= mid.w + 0.5 * mid.H && Math.abs(tb0.eta - mid.etaT) < 1e-6 && tb0.s < 0.01 && tubeMid.s > 0.99 && Math.abs(tubeMid.y - mid.rootZ) < 1e-3, `${tubeSpawn && tubeSpawn.length} tubes at spawn; col 120: a0 ${f2(tb0 && tb0.a0)} a1 ${f2(tb0 && tb0.a1)} eta ${f2(tb0 && tb0.eta)} s ${f2(tb0 && tb0.s)} -> mid s ${f2(tubeMid && tubeMid.s)}; bad frames/entries ${tubeBad}`);
   brk.dispose();
   // slot pool short of loops: every curtain sample keeps its loop, splash sheets are what gets dropped
@@ -408,12 +415,13 @@ console.log('\n# 10. Spray particles: emission, gravity, wind drift, death');
     if (a && a.points[120].p >= 0.3) { b = brk.model.breakers[0]; i = 120 - b.c0; }
   }
   const prof = brk.model.newProfile();
-  const before = { launch: 0 + b.etaC[i], root: b.yRoot[i], floor: 0 + brk.tubes.find((tb) => Math.abs(tb.y - b.zRoot[i]) < 1e-6).eta, sheet: brk.model.lipProfile(b, i, prof).y[1] };
+  const tubeOf = () => brk.tubes.find((tb) => Math.abs(tb.y - b.zRoot[i]) < 1e-6);
+  const before = { launch: 0 + b.etaC[i], root: b.yRoot[i], floor: 0 + tubeOf().eta, sheet: brk.model.lipProfile(b, i, prof).y[1], h0: tubeOf().h0, h1: tubeOf().h1 };
   // the solver keeps the absolute surface when the level moves, so the records' eta drop by 1 m
   const shifted = cs.sc.records(t); for (let k = 0; k < shifted.length; k += 8) if (shifted[k] >= 0) { shifted[k + 1] -= 1; shifted[k + 4] -= 1; }
   brk.update(shifted, DT, { t, wl: 1, swell: cs.swell });
-  const after = { launch: 1 + b.etaC[i], root: b.yRoot[i], floor: 1 + brk.tubes.find((tb) => Math.abs(tb.y - b.zRoot[i]) < 1e-6).eta, sheet: brk.model.lipProfile(b, i, prof).y[1] };
-  const ok = Math.abs(after.launch - before.launch) < 1e-6 && Math.abs(after.floor - before.floor) < 1e-6 && Math.abs(after.root - before.root) < 1e-3 && Math.abs(after.sheet - before.sheet) < 1e-3;
+  const after = { launch: 1 + b.etaC[i], root: b.yRoot[i], floor: 1 + tubeOf().eta, sheet: brk.model.lipProfile(b, i, prof).y[1], h0: tubeOf().h0, h1: tubeOf().h1 };
+  const ok = Math.abs(after.launch - before.launch) < 1e-6 && Math.abs(after.floor - before.floor) < 1e-6 && Math.abs(after.root - before.root) < 1e-3 && Math.abs(after.sheet - before.sheet) < 1e-3 && Math.abs(after.h0 - before.h0) < 1e-6 && Math.abs(after.h1 - before.h1) < 1e-6;
   check('tide +1 m mid-throw: launch height, tube floor, root and sheet keep their absolute elevation', ok, `launch ${f3(before.launch)} -> ${f3(after.launch)}, floor ${f3(before.floor)} -> ${f3(after.floor)}, root ${f3(before.root)} -> ${f3(after.root)}, sheet ${f3(before.sheet)} -> ${f3(after.sheet)}`);
   brk.dispose();
 }

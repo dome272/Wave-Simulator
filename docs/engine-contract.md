@@ -100,7 +100,7 @@ sol.hotStart(t)                 // state := target field at time t everywhere, F
 sol.step(dt, t)                 // one SSP-RK2 step; t is the simulation time at the START of the step (for the targets)
 sol.textures.state              // THREE.Texture nx*ny RGBA32F: (h, P, Q, F)   -- read by the renderer
 sol.textures.bathy              // THREE.Texture nx*ny RGBA32F: (B, d, chiBed, n)   -- B cell bed, d = wl - B
-sol.readCrests()                // Float32Array (see section 5): the crest-scan pass, read back through a pixel buffer one call behind (asyncCrests: false reads synchronously)
+sol.readCrests()                // Float32Array (see section 5) or null when no scan has completed since the last call (a dropped frame: the breakers age their crests). The scan is read back through a ring of three pixel buffers: every signalled scan is drained each call (usually two calls behind on a real GPU); only a full ring with nothing signalled is waited for (asyncCrests: false reads synchronously)
 sol.maxSpeed()                  // number (m/s), from a reduction pass + small synchronous readback
 sol.maxSpeedIssue()             // true: the reduction is queued and read back behind a fence (false: no reduction on this grid, use maxSpeed())
 sol.maxSpeedPoll()              // the issued result once the GPU has finished it (-1 until then: at least the next frame)
@@ -162,9 +162,11 @@ the whitewater source and to decide where the solver's crest is a bore.
 
 A pass with output `V x K` (K = 6 slots per visible column, `I` in
 `[ML, ML+V)`), two RGBA32F outputs, written every frame after the last
-sub-step and read back by `readCrests()` (through a pixel buffer object and a
-fence, so the records describe the previous call's scan; `asyncCrests: false`
-reads synchronously) as one
+sub-step and read back by `readCrests()` (through a ring of three pixel buffer
+objects behind fences: each call drains every scan whose fence has signalled
+and returns the newest, usually the scan of two calls ago on a real GPU, or
+null when none has completed since the last call; the CPU only waits when all
+three are in flight; `asyncCrests: false` reads synchronously) as one
 `Float32Array(V*K*8)` laid out `[(col*K + slot)*8 + channel]`, channels:
 
 ```
@@ -254,6 +256,18 @@ foam ping-pong; a new "present" pass fills `waveRT` from the solver state
 linear wave pass when the engine is on. The breakers' group is added to the
 scene and their splats go into the foam pass. The linear pipeline stays as
 the fallback (no WebGL2 float render targets, or the user switches it off).
+
+`brk.tubes` (one strip per lip sample, see `src/breakers/index.js`) drive the
+renderer's barrel mask: the carve pulls the surface down to the trough under
+the lip, and while the lip is in the air (`hold`) the sample's whole breaking
+band `[h0, h1]` keeps the foam source off and wipes the bore the solver lit
+before the launch, so the whitewater arrives with the impact. The mask takes
+the max over strips; a run of airborne samples is one flat strip whose ends
+fade over a few metres. The foam source itself is read from the spline-sampled
+breaking field (no cell edges) and the water shader draws it through gradient
+noise at several scales (streaks along the flow in fresh foam, patches and
+specks as it ages); the whitewater field is coarse (the render grid), the
+look comes from the noise, not the resolution.
 
 ## 8. Testing infrastructure
 

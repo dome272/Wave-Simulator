@@ -37,6 +37,28 @@ float vnoise(vec2 p) {
 float fbm2(vec2 p) {
   return 0.5 * vnoise(p) + 0.25 * vnoise(p * 2.03 + 7.1) + 0.125 * vnoise(p * 4.1 + 3.3) + 0.0625 * vnoise(p * 8.3 + 1.7);
 }
+vec2 hash22(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.xx + p3.yz) * p3.zy) * 2.0 - 1.0;
+}
+// Gradient noise (quintic fade). Value noise puts its features on the lattice,
+// so a threshold through it reads as a grid of blocks up close; this does not.
+float gnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  return mix(mix(dot(hash22(i), f), dot(hash22(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0)), u.x),
+             mix(dot(hash22(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0)), dot(hash22(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0)), u.x), u.y);
+}
+// fbm of gradient noise, each octave rotated, in [0, 1] around 0.5.
+float gfbm(vec2 p) {
+  const mat2 R = mat2(1.616, 1.212, -1.212, 1.616); // 37 degrees, x2.02
+  float s = 0.5 * gnoise(p); p = R * p + 7.1;
+  s += 0.25 * gnoise(p); p = R * p + 3.3;
+  s += 0.125 * gnoise(p); p = R * p + 1.7;
+  s += 0.0625 * gnoise(p);
+  return clamp(0.5 + 1.1 * s, 0.0, 1.0);
+}
 vec3 bedColor(float z, float rock, vec2 p) {
   float n = fbm2(p * 0.08);
   vec3 dry = vec3(0.89, 0.81, 0.64) * (0.92 + 0.16 * n);
@@ -143,7 +165,9 @@ export function createRenderer(canvas) {
   // The shock-capturing scheme leaves cell-scale roughness along a bore front
   // that bilinear sampling turns into pyramids at eye level; the spline rounds
   // it to a bump a cell wide and keeps the front where it is.
-  float engineEtaSmooth(vec2 uv, out float wetness) {
+  // F (the breaking field, a per-cell flag) gets the same spline so the
+  // whitewater source has no cell-shaped edges.
+  float engineEtaSmooth(vec2 uv, out float wetness, out float F) {
     vec2 tc = uv * uExt / uLay.z + uLay.xy - 0.5;
     ivec2 sz = textureSize(uState, 0);
     ivec2 i0 = ivec2(floor(tc));
@@ -151,7 +175,7 @@ export function createRenderer(canvas) {
     vec2 f2 = f * f, f3 = f2 * f;
     vec4 wx = vec4((1.0 - 3.0 * f.x + 3.0 * f2.x - f3.x), (4.0 - 6.0 * f2.x + 3.0 * f3.x), (1.0 + 3.0 * f.x + 3.0 * f2.x - 3.0 * f3.x), f3.x) / 6.0;
     vec4 wy = vec4((1.0 - 3.0 * f.y + 3.0 * f2.y - f3.y), (4.0 - 6.0 * f2.y + 3.0 * f3.y), (1.0 + 3.0 * f.y + 3.0 * f2.y - 3.0 * f3.y), f3.y) / 6.0;
-    float W = 0.0, ww = 0.0;
+    float W = 0.0, ww = 0.0, FF = 0.0;
     for (int j = 0; j < 4; j++) {
       for (int i = 0; i < 4; i++) {
         ivec2 ij = clamp(i0 + ivec2(i - 1, j - 1), ivec2(0), sz - 1);
@@ -159,12 +183,14 @@ export function createRenderer(canvas) {
         vec4 st = texelFetch(uState, ij, 0);
         float wet = smoothstep(0.005, 0.04, st.x);
         W += w * wet * (texelFetch(uBathy, ij, 0).x + st.x); ww += w * wet;
+        FF += w * st.w;
       }
     }
-    wetness = ww;
+    wetness = ww; F = FF;
     if (ww < 0.35) return bl(uHeight, uv).x - uWl - 0.08;
     return W / ww - uWl;
   }
+  float engineEtaSmooth(vec2 uv, out float wetness) { float F; return engineEtaSmooth(uv, wetness, F); }
   `;
 
   // --- wave pass -----------------------------------------------------------
@@ -261,13 +287,16 @@ export function createRenderer(canvas) {
   // sample) and this mask pulls the surface down to the trough inside them so
   // the lip curtain forms the roof, and shades the water under the lip.
   const MAX_TUBES = 24 * 512;
+  const MAX_QUADS = MAX_TUBES * 4; // the carve strip plus a three-piece hold strip per tube
   const maskRT = new THREE.WebGLRenderTarget(M, M, rtOpts);
   const footGeo = new THREE.BufferGeometry();
-  const footPos = new Float32Array(MAX_TUBES * 4 * 3), footAttr = new Float32Array(MAX_TUBES * 4 * 4); // (a, eta, s, a1)
+  const footPos = new Float32Array(MAX_QUADS * 4 * 3), footAttr = new Float32Array(MAX_QUADS * 4 * 4); // (a, eta, s, a1)
+  const footHold = new Float32Array(MAX_QUADS * 4); // 1 while the lip is in the air: no whitewater under it yet
   footGeo.setAttribute('position', new THREE.BufferAttribute(footPos, 3).setUsage(THREE.DynamicDrawUsage));
   footGeo.setAttribute('attr', new THREE.BufferAttribute(footAttr, 4).setUsage(THREE.DynamicDrawUsage));
-  const footIdx = new Uint32Array(MAX_TUBES * 6);
-  for (let q = 0; q < MAX_TUBES; q++) {
+  footGeo.setAttribute('hold', new THREE.BufferAttribute(footHold, 1).setUsage(THREE.DynamicDrawUsage));
+  const footIdx = new Uint32Array(MAX_QUADS * 6);
+  for (let q = 0; q < MAX_QUADS; q++) {
     const v = q * 4, k = q * 6;
     footIdx[k] = v; footIdx[k + 1] = v + 2; footIdx[k + 2] = v + 1; footIdx[k + 3] = v + 1; footIdx[k + 4] = v + 2; footIdx[k + 5] = v + 3;
   }
@@ -277,13 +306,13 @@ export function createRenderer(canvas) {
     glslVersion: THREE.GLSL3,
     uniforms: { uExt: shared.uExt },
     vertexShader: /* glsl */ `
-      in vec3 position; in vec4 attr;
+      in vec3 position; in vec4 attr; in float hold;
       uniform float uExt;
-      out vec4 vA;
-      void main() { vA = attr; gl_Position = vec4(position.xz / (uExt * 0.5), 0.0, 1.0); }`,
+      out vec4 vA; out float vH;
+      void main() { vA = attr; vH = hold; gl_Position = vec4(position.xz / (uExt * 0.5), 0.0, 1.0); }`,
     fragmentShader: /* glsl */ `
       precision highp float;
-      in vec4 vA;
+      in vec4 vA; in float vH;
       out vec4 o;
       void main() {
         // a: metres ahead of the crest root inside the strip [a0, a1]: a wall at
@@ -294,7 +323,10 @@ export function createRenderer(canvas) {
         float shade = vA.z * max(0.0, 1.0 - a / max(a1 * 0.8, 0.1));
         // The target is blended with MAX against a zero clear, so the floor
         // level (usually a trough below still water) is stored with an offset.
-        o = vec4(w, vA.y + 16.0, shade, max(w, shade * 0.999));
+        // w: the foam hold (the face under a lip in the air stays green). Hold
+        // quads carry a = 0..a1 from their back edge; fade at both ends.
+        float hold = vH * clamp(min(a, a1 - a) / 2.5, 0.0, 1.0);
+        o = vec4(w, vA.y + 16.0, shade, hold);
       }`,
     transparent: true,
     depthTest: false,
@@ -311,23 +343,38 @@ export function createRenderer(canvas) {
   // Fill the strip geometry from the breakers' tubes.
   function updateFootprint(tubes) {
     let q = 0;
-    for (const tb of tubes || []) {
-      if (!tb || tb.s <= 0 || q >= MAX_TUBES) continue;
-      const px = -tb.dy * tb.hw, py = tb.dx * tb.hw; // half-width along the crest
-      const bx = tb.x + tb.dx * tb.a0, by = tb.y + tb.dy * tb.a0;
-      const fx = tb.x + tb.dx * tb.a1, fy = tb.y + tb.dy * tb.a1;
-      const v = q * 4;
-      const put = (k, x, y, a) => {
-        footPos[(v + k) * 3] = x; footPos[(v + k) * 3 + 1] = 0; footPos[(v + k) * 3 + 2] = y;
-        const o = (v + k) * 4; footAttr[o] = a; footAttr[o + 1] = tb.eta; footAttr[o + 2] = tb.s; footAttr[o + 3] = tb.a1;
-      };
-      put(0, bx - px, by - py, tb.a0); put(1, bx + px, by + py, tb.a0);
-      put(2, fx - px, fy - py, tb.a1); put(3, fx + px, fy + py, tb.a1);
+    const put = (v, x, y, a, eta, s, a1, hold) => {
+      footPos[v * 3] = x; footPos[v * 3 + 1] = 0; footPos[v * 3 + 2] = y;
+      const o = v * 4; footAttr[o] = a; footAttr[o + 1] = eta; footAttr[o + 2] = s; footAttr[o + 3] = a1;
+      footHold[v] = hold;
+    };
+    // A quad along the strip's normal from a0 to a1, across it from u0 to u1
+    // (in half-widths); the attr a runs aa0..aa1, hold h0 at u0 and h1 at u1.
+    const quad = (tb, a0, a1, u0, u1, aa0, aa1, eta, s, h0, h1) => {
+      const px = -tb.dy * tb.hw, py = tb.dx * tb.hw;
+      const bx = tb.x + tb.dx * a0, by = tb.y + tb.dy * a0, fx = tb.x + tb.dx * a1, fy = tb.y + tb.dy * a1;
+      const v = q * 4, L = aa1;
+      put(v, bx + px * u0, by + py * u0, aa0, eta, s, L, h0); put(v + 1, bx + px * u1, by + py * u1, aa0, eta, s, L, h1);
+      put(v + 2, fx + px * u0, fy + py * u0, aa1, eta, s, L, h0); put(v + 3, fx + px * u1, fy + py * u1, aa1, eta, s, L, h1);
       q++;
+    };
+    for (const tb of tubes || []) {
+      if (!tb || (tb.s <= 0 && !(tb.hold > 0)) || q + 4 > MAX_QUADS) continue;
+      // the carve: the strip [a0, a1], one half-width each side of the sample
+      if (tb.s > 0) quad(tb, tb.a0, tb.a1, -1, 1, tb.a0, tb.a1, tb.eta, tb.s, 0, 0);
+      // the hold: the whole breaking band [h0, h1] of this sample, a plateau
+      // one half-width each side with ramps out to 3.5 (the mask takes the
+      // max, so a run of airborne samples is one flat strip with soft ends)
+      if (tb.hold > 0) {
+        const L = tb.h1 - tb.h0, h = tb.hold;
+        quad(tb, tb.h0, tb.h1, -3.5, -1, 0, L, -16, 0, 0, h);
+        quad(tb, tb.h0, tb.h1, -1, 1, 0, L, -16, 0, h, h);
+        quad(tb, tb.h0, tb.h1, 1, 3.5, 0, L, -16, 0, h, 0);
+      }
     }
     footGeo.setDrawRange(0, q * 6);
     if (q === 0) return false; // no upload: ranges only clear when the buffer is uploaded
-    for (const [att, sz] of [[footGeo.attributes.position, 12], [footGeo.attributes.attr, 16]]) {
+    for (const [att, sz] of [[footGeo.attributes.position, 12], [footGeo.attributes.attr, 16], [footGeo.attributes.hold, 4]]) {
       att.clearUpdateRanges();
       att.addUpdateRange(0, q * sz);
       att.needsUpdate = true;
@@ -335,35 +382,65 @@ export function createRenderer(canvas) {
     return true;
   }
 
-  // --- present pass: engine state -> the M x M wave texture ----------------
-  const presentMat = new THREE.RawShaderMaterial({
+  // --- smooth pass: the spline-sampled engine surface and breaking field ---
+  // (eta, F, wetness) at the M x M texels; the present pass reads its own
+  // texel and the neighbours for the slope, so the spline runs once per texel.
+  const smoothRT = new THREE.WebGLRenderTarget(M, M, rtOpts);
+  const smoothMat = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
-    uniforms: { ...shared, uM: { value: M }, uMask: { value: maskRT.texture }, uSmooth: { value: 1 }, uCarve: { value: 1 } },
+    uniforms: { ...shared, uM: { value: M } },
     vertexShader: passVS,
     fragmentShader: COMMON + ENGINE_GLSL + /* glsl */ `
-      uniform float uM, uSmooth, uCarve;
-      uniform sampler2D uMask;
+      uniform float uM;
       out vec4 o;
       void main() {
         vec2 uv = (gl_FragCoord.xy - 0.5) / (uM - 1.0);
-        float wet, wetS;
+        float wet, F;
+        float eta = engineEtaSmooth(uv, wet, F);
+        o = vec4(eta, F, wet, 0.0);
+      }`,
+    depthTest: false,
+    depthWrite: false,
+  });
+  const smoothQuad = new THREE.Mesh(quadGeo, smoothMat);
+  smoothQuad.frustumCulled = false;
+  const smoothScene = new THREE.Scene();
+  smoothScene.add(smoothQuad);
+
+  // --- present pass: engine state -> the M x M wave texture ----------------
+  const presentMat = new THREE.RawShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    uniforms: { ...shared, uM: { value: M }, uMask: { value: maskRT.texture }, uSmoothTex: { value: smoothRT.texture }, uSmooth: { value: 1 }, uCarve: { value: 1 } },
+    vertexShader: passVS,
+    fragmentShader: COMMON + ENGINE_GLSL + /* glsl */ `
+      uniform float uM, uSmooth, uCarve;
+      uniform sampler2D uMask, uSmoothTex;
+      out vec4 o;
+      void main() {
+        vec2 uv = (gl_FragCoord.xy - 0.5) / (uM - 1.0);
+        ivec2 ic = ivec2(gl_FragCoord.xy), mx = ivec2(int(uM) - 1);
+        float wet;
         vec4 e = engineSample(uv, wet);
-        float etaS = engineEtaSmooth(uv, wetS);
-        e.x = mix(e.x, etaS, uSmooth);
+        vec4 sm = texelFetch(uSmoothTex, ic, 0);
+        e.x = mix(e.x, sm.x, uSmooth);
         vec4 mk = texture(uMask, gl_FragCoord.xy / uM);
         float eta = mix(e.x, min(e.x, mk.y - 16.0), mk.x * uCarve);
         // Whitewater source: the breaking field, weighted by the steepness of
         // the surface so the roller at the front of a bore is white and the
         // water behind it only patchy (the breaking flag stays on for a while
-        // behind the front, and over the whole inner surf zone).
-        float du = 1.0 / (uM - 1.0), dm = uExt / (uM - 1.0);
-        float wq;
-        float gx = (engineSample(uv + vec2(du, 0.0), wq).x - engineSample(uv - vec2(du, 0.0), wq).x) / (2.0 * dm);
-        float gy = (engineSample(uv + vec2(0.0, du), wq).x - engineSample(uv - vec2(0.0, du), wq).x) / (2.0 * dm);
+        // behind the front, and over the whole inner surf zone). Both come
+        // from the spline-sampled fields, so the source has no cell edges.
+        float dm = uExt / (uM - 1.0);
+        float gx = (texelFetch(uSmoothTex, clamp(ic + ivec2(1, 0), ivec2(0), mx), 0).x - texelFetch(uSmoothTex, clamp(ic - ivec2(1, 0), ivec2(0), mx), 0).x) / (2.0 * dm);
+        float gy = (texelFetch(uSmoothTex, clamp(ic + ivec2(0, 1), ivec2(0), mx), 0).x - texelFetch(uSmoothTex, clamp(ic - ivec2(0, 1), ivec2(0), mx), 0).x) / (2.0 * dm);
         float front = smoothstep(0.03, 0.12, length(vec2(gx, gy)));
-        float src = smoothstep(0.15, 0.6, e.w) * (0.3 + 0.7 * front) * wet;
-        // y carries the tube shadow (the water VS ignores displacement in engine mode).
-        o = vec4(eta, mk.z, 0.0, src);
+        // Under a lip still in the air the face stays green: the whitewater
+        // comes with the impact (mask.w, from the breakers).
+        float open = 1.0 - smoothstep(0.15, 0.7, mk.w); // a fairly sharp curl line, not a wide speckled one
+        float src = smoothstep(0.15, 0.6, sm.y) * (0.15 + 0.85 * front) * wet * open;
+        // y carries the tube shadow (the water VS ignores displacement in engine
+        // mode); z the roller, the steep front of a breaking wave.
+        o = vec4(eta, mk.z, smoothstep(0.15, 0.6, sm.y) * front * wet * open, src);
       }`,
     depthTest: false,
     depthWrite: false,
@@ -378,10 +455,10 @@ export function createRenderer(canvas) {
   const splatArray = Array.from({ length: MAX_SPLATS }, () => new THREE.Vector4());
   const foamMat = new THREE.RawShaderMaterial({
     glslVersion: THREE.GLSL3,
-    uniforms: { ...shared, uPrev: { value: null }, uWave: { value: waveRT.texture }, uDt: { value: 0 }, uM: { value: M }, uSplat: { value: splatArray }, uNSplat: { value: 0 } },
+    uniforms: { ...shared, uPrev: { value: null }, uWave: { value: waveRT.texture }, uMask: { value: maskRT.texture }, uDt: { value: 0 }, uM: { value: M }, uSplat: { value: splatArray }, uNSplat: { value: 0 } },
     vertexShader: passVS,
     fragmentShader: COMMON + ENGINE_GLSL + /* glsl */ `
-      uniform sampler2D uPrev, uWave, uBed, uDir;
+      uniform sampler2D uPrev, uWave, uMask, uBed, uDir;
       uniform float uDt, uM;
       uniform vec4 uSplat[${MAX_SPLATS}];
       uniform int uNSplat;
@@ -405,23 +482,32 @@ export function createRenderer(canvas) {
         vec4 pf = texture(uPrev, tuv - vel * uDt / uExt);
         vec4 ps = texture(uPrev, tuv - vel * 0.12 * uDt / uExt);
         vec4 pw = texture(uPrev, tuv);
-        float src = texelFetch(uWave, ivec2(gl_FragCoord.xy), 0).w;
+        vec4 wv = texelFetch(uWave, ivec2(gl_FragCoord.xy), 0);
+        float src = wv.w;
+        // The roller: the steep front of a breaking wave (classic mode: its foam).
+        float rollerSrc = uEngine > 0.5 ? wv.z : wv.w;
         // Foam splats from the breakers (lip impacts, splash-up), in world metres.
         vec2 wp = uv * uExt - uExt * 0.5;
+        float splat = 0.0;
         for (int i = 0; i < ${MAX_SPLATS}; i++) {
           if (i >= uNSplat) break;
           vec4 sp = uSplat[i];
-          src = max(src, sp.w * (1.0 - smoothstep(sp.z * 0.5, sp.z, length(wp - sp.xy))));
+          splat = max(splat, sp.w * (1.0 - smoothstep(sp.z * 0.5, sp.z, length(wp - sp.xy))));
         }
-        float bore = max(pf.r * exp(-uDt / 2.2), src);
+        src = max(src, splat); rollerSrc = max(rollerSrc, splat);
+        // Under a lip in the air (mask.w) the face stays green: whitewater the
+        // solver's bore lit before the lip launched is wiped until the impact.
+        float open = 1.0 - uEngine * smoothstep(0.15, 0.7, texture(uMask, tuv).w);
+        float bore = max(pf.r * exp(-uDt / 1.7), min(src, pf.r + uDt * 3.0)) * open; // fresh foam builds up over 0.3 s
+        float roller = max(pf.a * exp(-uDt / 0.45), rollerSrc) * open;
         // Residue: the real-fluid engine re-sources foam on every bore, so it
         // accumulates less of it and loses it faster than the classic engine.
         float gain = uEngine > 0.5 ? 0.06 : 0.15, tauR = uEngine > 0.5 ? 11.0 : 16.0;
         float resid = min(1.0, ps.g * exp(-uDt / tauR) + bore * uDt * gain);
-        if (h < 0.02) { bore = 0.0; resid *= 0.9; }
+        if (h < 0.02) { bore = 0.0; roller = 0.0; resid *= 0.9; }
         // Wet sand: where water has been recently, drying out slowly.
         float wetness = max(pw.b * exp(-uDt / 28.0), wetNow);
-        o = vec4(bore, resid, wetness, 1.0);
+        o = vec4(bore, resid, wetness, roller);
       }`,
     depthTest: false,
     depthWrite: false,
@@ -628,7 +714,7 @@ export function createRenderer(canvas) {
       gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
     }`;
   const waterFS = COMMON + /* glsl */ `
-    uniform sampler2D uFoam;
+    uniform sampler2D uFoam, uDir;
     uniform vec3 uCam;
     uniform float uContours, uTime, uAlpha, uDebug;
     uniform vec4 uBrush;
@@ -672,16 +758,32 @@ export function createRenderer(canvas) {
       c *= 1.0 - 0.55 * clamp(vShade, 0.0, 1.0);
       vec3 hv = normalize(SUN + v);
       c += vec3(1.0, 0.9, 0.7) * pow(max(dot(n, hv), 0.0), 400.0) * 3.0;
-      // Foam: active whitewater plus the lacy residue it leaves behind.
+      // Foam. The foam field (r: whitewater, fading as it ages; a: the roller
+      // at the front of a bore; g: the lacy residue) is coarse (the simulation
+      // cells), so it is drawn through noise at several scales: streaks along
+      // the wave direction, metre lumps and fine grain. Fresh whitewater is a
+      // solid sheet; as it ages it breaks into streaks, patches and specks.
       vec4 f = texture(uFoam, vUv);
-      float tex = fbm2(p * 0.55 + vec2(0.0, uTime * 0.25)) * 0.7 + 0.3 * fbm2(p * 2.1 - uTime * 0.3);
-      // Fine lumps so a sheet of whitewater is not a flat white field up close.
-      float fine = fbm2(p * 1.3 + vec2(uTime * 0.35, -uTime * 0.2));
-      float act = smoothstep(0.05, 0.45, f.r * 1.15 - tex * 0.6 + 0.05) * (0.8 + 0.2 * smoothstep(0.25, 0.75, fine));
+      vec2 wd = bl(uDir, vUv).xy;
+      wd = length(wd) > 1e-3 ? normalize(wd) : vec2(0.0, 1.0);
+      vec2 q = vec2(dot(p, wd), dot(p, vec2(-wd.y, wd.x))); // along / across the wave
+      // Fresh whitewater is streaked along the flow; as it ages it breaks into
+      // round patches, then specks (streaks through old foam read as a comb).
+      float fresh = smoothstep(0.3, 0.85, f.r);
+      float streak = gfbm(vec2(q.x * 0.3 - uTime * 0.5, q.y * 0.65));
+      float blot = gfbm(p * 0.5 + vec2(uTime * 0.12, -uTime * 0.08));
+      float lump = 0.6 * gfbm(p * 1.1 + vec2(uTime * 0.3, -uTime * 0.2)) + 0.4 * gfbm(p * 0.4 + vec2(-uTime * 0.15, uTime * 0.1));
+      float grain = clamp(0.5 + 1.2 * gnoise(p * 6.0 + vec2(uTime * 0.9, uTime * 0.4)), 0.0, 1.0);
+      float thr = 0.32 * mix(blot, streak, fresh) + 0.5 * lump + 0.1 * grain; // patches decide where foam dissolves, grain only textures it
+      float act = smoothstep(0.0, 0.16, f.r * 1.15 - thr);
+      // The roller: dense, tumbling, bright.
+      float roller = smoothstep(0.1, 0.5, f.a * 1.3 - 0.35 * lump - 0.25 * grain);
+      act = max(act, roller);
+      float tex = gfbm(p * 0.55 + vec2(0.0, uTime * 0.25)) * 0.7 + 0.3 * gfbm(p * 2.1 - uTime * 0.3);
       float lace = smoothstep(0.66, 0.9, tex * 1.1 + 0.3 * f.g) * smoothstep(0.02, 0.45, f.g);
       float shore = smoothstep(0.3, 0.0, col_h) * 0.6 * smoothstep(0.35, 0.65, fbm2(p * 0.25 + uTime * 0.2));
       float foam = clamp(max(act, max(lace * 0.85, shore)), 0.0, 1.0);
-      vec3 fc = (vec3(0.93, 0.95, 0.96) * (0.72 + 0.28 * max(dot(n, SUN), 0.0)) + 0.06) * (0.9 + 0.12 * fine);
+      vec3 fc = (vec3(0.93, 0.95, 0.96) * (0.72 + 0.28 * max(dot(n, SUN), 0.0)) + 0.06) * (0.84 + 0.1 * lump + 0.08 * grain + 0.1 * roller);
       c = mix(c, fc, foam);
       if (uContours > 0.5) {
         float z = vBedZ - uWl;
@@ -840,6 +942,8 @@ export function createRenderer(canvas) {
       renderer.setClearColor(0x000000, 0);
       renderer.clear();
       if (engine.breakers && updateFootprint(engine.breakers.tubes)) renderer.render(maskScene, quadCam);
+      renderer.setRenderTarget(smoothRT);
+      renderer.render(smoothScene, quadCam);
       renderer.setRenderTarget(waveRT);
       renderer.render(presentScene, quadCam);
     } else {

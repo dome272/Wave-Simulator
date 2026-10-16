@@ -92,6 +92,15 @@ const within = (c) => c.dh <= TOL.dh && c.dP <= TOL.dP && c.dQ <= TOL.dQ && !c.n
     check('plane beach: asynchronous maxSpeed (issue + poll) returns the same value on a later frame', r.maxSpeed.issued && r.maxSpeed.asyncFrames >= 1 && Math.abs(r.maxSpeed.async - r.maxSpeed.gpu) <= 1e-6 * r.maxSpeed.gpu, `async ${r.maxSpeed.async.toFixed(4)} after ${r.maxSpeed.asyncFrames} frame(s)`);
   }
 }
+// 3c. crest readback ring
+{
+  const r = await run('ring');
+  if (r.error) check('crest readback ring', false, r.error.split('\n')[0]);
+  else {
+    check('crest ring: a tight loop gets null three times, then the oldest scan (waited for)', r.seq.join() === 'null,null,null,records,records', r.seq.join());
+    check('crest ring: after a few frames one call drains the ring and the next, with nothing new, returns null', r.drained && r.againNull, `drained ${r.drained} again null ${r.againNull}`);
+  }
+}
 // 3b. bathymetry update
 {
   const r = await run('rebase');
