@@ -339,6 +339,8 @@ function viewInfo() {
     // else the classic forecast.
     spot: measured || (last ? last.summary.spot : null),
     ground: (x, z) => sampleZ(beach.z, x + EXT / 2, z + EXT / 2),
+    // On a real beach the beach view stands on its sand beach, at the middle of the grid.
+    stand: beach.real ? { x: 0, shoreZ: shoreAt(0) } : null,
   };
 }
 document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => R.setView(b.dataset.view, viewInfo())));
