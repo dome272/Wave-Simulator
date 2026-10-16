@@ -256,6 +256,18 @@ linear wave pass when the engine is on. The breakers' group is added to the
 scene and their splats go into the foam pass. The linear pipeline stays as
 the fallback (no WebGL2 float render targets, or the user switches it off).
 
+`brk.tubes` (one strip per lip sample, see `src/breakers/index.js`) drive the
+renderer's barrel mask: the carve pulls the surface down to the trough under
+the lip, and while the lip is in the air (`hold`) the sample's whole breaking
+band `[h0, h1]` keeps the foam source off and wipes the bore the solver lit
+before the launch, so the whitewater arrives with the impact. The mask takes
+the max over strips; a run of airborne samples is one flat strip whose ends
+fade over a few metres. The foam source itself is read from the spline-sampled
+breaking field (no cell edges) and the water shader draws it through gradient
+noise at several scales (streaks along the flow in fresh foam, patches and
+specks as it ages); the whitewater field is coarse (the render grid), the
+look comes from the noise, not the resolution.
+
 ## 8. Testing infrastructure
 
 - Static server: `cd /home/claude/wave-simulator && npx http-server -p 8099 -s -c-1 .`

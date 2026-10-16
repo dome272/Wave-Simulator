@@ -37,6 +37,28 @@ float vnoise(vec2 p) {
 float fbm2(vec2 p) {
   return 0.5 * vnoise(p) + 0.25 * vnoise(p * 2.03 + 7.1) + 0.125 * vnoise(p * 4.1 + 3.3) + 0.0625 * vnoise(p * 8.3 + 1.7);
 }
+vec2 hash22(vec2 p) {
+  vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+  p3 += dot(p3, p3.yzx + 33.33);
+  return fract((p3.xx + p3.yz) * p3.zy) * 2.0 - 1.0;
+}
+// Gradient noise (quintic fade). Value noise puts its features on the lattice,
+// so a threshold through it reads as a grid of blocks up close; this does not.
+float gnoise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+  return mix(mix(dot(hash22(i), f), dot(hash22(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0)), u.x),
+             mix(dot(hash22(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0)), dot(hash22(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0)), u.x), u.y);
+}
+// fbm of gradient noise, each octave rotated, in [0, 1] around 0.5.
+float gfbm(vec2 p) {
+  const mat2 R = mat2(1.616, 1.212, -1.212, 1.616); // 37 degrees, x2.02
+  float s = 0.5 * gnoise(p); p = R * p + 7.1;
+  s += 0.25 * gnoise(p); p = R * p + 3.3;
+  s += 0.125 * gnoise(p); p = R * p + 1.7;
+  s += 0.0625 * gnoise(p);
+  return clamp(0.5 + 1.1 * s, 0.0, 1.0);
+}
 vec3 bedColor(float z, float rock, vec2 p) {
   float n = fbm2(p * 0.08);
   vec3 dry = vec3(0.89, 0.81, 0.64) * (0.92 + 0.16 * n);
@@ -265,15 +287,16 @@ export function createRenderer(canvas) {
   // sample) and this mask pulls the surface down to the trough inside them so
   // the lip curtain forms the roof, and shades the water under the lip.
   const MAX_TUBES = 24 * 512;
+  const MAX_QUADS = MAX_TUBES * 4; // the carve strip plus a three-piece hold strip per tube
   const maskRT = new THREE.WebGLRenderTarget(M, M, rtOpts);
   const footGeo = new THREE.BufferGeometry();
-  const footPos = new Float32Array(MAX_TUBES * 4 * 3), footAttr = new Float32Array(MAX_TUBES * 4 * 4); // (a, eta, s, a1)
-  const footHold = new Float32Array(MAX_TUBES * 4); // 1 while the lip is in the air: no whitewater under it yet
+  const footPos = new Float32Array(MAX_QUADS * 4 * 3), footAttr = new Float32Array(MAX_QUADS * 4 * 4); // (a, eta, s, a1)
+  const footHold = new Float32Array(MAX_QUADS * 4); // 1 while the lip is in the air: no whitewater under it yet
   footGeo.setAttribute('position', new THREE.BufferAttribute(footPos, 3).setUsage(THREE.DynamicDrawUsage));
   footGeo.setAttribute('attr', new THREE.BufferAttribute(footAttr, 4).setUsage(THREE.DynamicDrawUsage));
   footGeo.setAttribute('hold', new THREE.BufferAttribute(footHold, 1).setUsage(THREE.DynamicDrawUsage));
-  const footIdx = new Uint32Array(MAX_TUBES * 6);
-  for (let q = 0; q < MAX_TUBES; q++) {
+  const footIdx = new Uint32Array(MAX_QUADS * 6);
+  for (let q = 0; q < MAX_QUADS; q++) {
     const v = q * 4, k = q * 6;
     footIdx[k] = v; footIdx[k + 1] = v + 2; footIdx[k + 2] = v + 1; footIdx[k + 3] = v + 1; footIdx[k + 4] = v + 2; footIdx[k + 5] = v + 3;
   }
@@ -300,8 +323,10 @@ export function createRenderer(canvas) {
         float shade = vA.z * max(0.0, 1.0 - a / max(a1 * 0.8, 0.1));
         // The target is blended with MAX against a zero clear, so the floor
         // level (usually a trough below still water) is stored with an offset.
-        // w: the foam hold (the face under a lip in the air stays green).
-        o = vec4(w, vA.y + 16.0, shade, vH);
+        // w: the foam hold (the face under a lip in the air stays green). Hold
+        // quads carry a = 0..a1 from their back edge; fade at both ends.
+        float hold = vH * clamp(min(a, a1 - a) / 2.5, 0.0, 1.0);
+        o = vec4(w, vA.y + 16.0, shade, hold);
       }`,
     transparent: true,
     depthTest: false,
@@ -318,20 +343,34 @@ export function createRenderer(canvas) {
   // Fill the strip geometry from the breakers' tubes.
   function updateFootprint(tubes) {
     let q = 0;
-    for (const tb of tubes || []) {
-      if (!tb || (tb.s <= 0 && !(tb.hold > 0)) || q >= MAX_TUBES) continue;
-      const px = -tb.dy * tb.hw, py = tb.dx * tb.hw; // half-width along the crest
-      const bx = tb.x + tb.dx * tb.a0, by = tb.y + tb.dy * tb.a0;
-      const fx = tb.x + tb.dx * tb.a1, fy = tb.y + tb.dy * tb.a1;
-      const v = q * 4, hold = tb.hold || 0;
-      const put = (k, x, y, a) => {
-        footPos[(v + k) * 3] = x; footPos[(v + k) * 3 + 1] = 0; footPos[(v + k) * 3 + 2] = y;
-        const o = (v + k) * 4; footAttr[o] = a; footAttr[o + 1] = tb.eta; footAttr[o + 2] = tb.s; footAttr[o + 3] = tb.a1;
-        footHold[v + k] = hold;
-      };
-      put(0, bx - px, by - py, tb.a0); put(1, bx + px, by + py, tb.a0);
-      put(2, fx - px, fy - py, tb.a1); put(3, fx + px, fy + py, tb.a1);
+    const put = (v, x, y, a, eta, s, a1, hold) => {
+      footPos[v * 3] = x; footPos[v * 3 + 1] = 0; footPos[v * 3 + 2] = y;
+      const o = v * 4; footAttr[o] = a; footAttr[o + 1] = eta; footAttr[o + 2] = s; footAttr[o + 3] = a1;
+      footHold[v] = hold;
+    };
+    // A quad along the strip's normal from a0 to a1, across it from u0 to u1
+    // (in half-widths); the attr a runs aa0..aa1, hold h0 at u0 and h1 at u1.
+    const quad = (tb, a0, a1, u0, u1, aa0, aa1, eta, s, h0, h1) => {
+      const px = -tb.dy * tb.hw, py = tb.dx * tb.hw;
+      const bx = tb.x + tb.dx * a0, by = tb.y + tb.dy * a0, fx = tb.x + tb.dx * a1, fy = tb.y + tb.dy * a1;
+      const v = q * 4, L = aa1;
+      put(v, bx + px * u0, by + py * u0, aa0, eta, s, L, h0); put(v + 1, bx + px * u1, by + py * u1, aa0, eta, s, L, h1);
+      put(v + 2, fx + px * u0, fy + py * u0, aa1, eta, s, L, h0); put(v + 3, fx + px * u1, fy + py * u1, aa1, eta, s, L, h1);
       q++;
+    };
+    for (const tb of tubes || []) {
+      if (!tb || (tb.s <= 0 && !(tb.hold > 0)) || q + 4 > MAX_QUADS) continue;
+      // the carve: the strip [a0, a1], one half-width each side of the sample
+      if (tb.s > 0) quad(tb, tb.a0, tb.a1, -1, 1, tb.a0, tb.a1, tb.eta, tb.s, 0, 0);
+      // the hold: the whole breaking band [h0, h1] of this sample, a plateau
+      // one half-width each side with ramps out to 3.5 (the mask takes the
+      // max, so a run of airborne samples is one flat strip with soft ends)
+      if (tb.hold > 0) {
+        const L = tb.h1 - tb.h0, h = tb.hold;
+        quad(tb, tb.h0, tb.h1, -3.5, -1, 0, L, -16, 0, 0, h);
+        quad(tb, tb.h0, tb.h1, -1, 1, 0, L, -16, 0, h, h);
+        quad(tb, tb.h0, tb.h1, 1, 3.5, 0, L, -16, 0, h, 0);
+      }
     }
     footGeo.setDrawRange(0, q * 6);
     if (q === 0) return false; // no upload: ranges only clear when the buffer is uploaded
@@ -459,7 +498,7 @@ export function createRenderer(canvas) {
         // Under a lip in the air (mask.w) the face stays green: whitewater the
         // solver's bore lit before the lip launched is wiped until the impact.
         float open = 1.0 - uEngine * texture(uMask, tuv).w;
-        float bore = max(pf.r * exp(-uDt / 1.7), src) * open;
+        float bore = max(pf.r * exp(-uDt / 1.7), min(src, pf.r + uDt * 3.0)) * open; // fresh foam builds up over 0.3 s
         float roller = max(pf.a * exp(-uDt / 0.45), rollerSrc) * open;
         // Residue: the real-fluid engine re-sources foam on every bore, so it
         // accumulates less of it and loses it faster than the classic engine.
@@ -728,15 +767,19 @@ export function createRenderer(canvas) {
       vec2 wd = bl(uDir, vUv).xy;
       wd = length(wd) > 1e-3 ? normalize(wd) : vec2(0.0, 1.0);
       vec2 q = vec2(dot(p, wd), dot(p, vec2(-wd.y, wd.x))); // along / across the wave
-      float streak = fbm2(vec2(q.x * 0.35 - uTime * 0.5, q.y * 1.1));
-      float lump = 0.6 * fbm2(p * 1.1 + vec2(uTime * 0.3, -uTime * 0.2)) + 0.4 * fbm2(p * 0.4 + vec2(-uTime * 0.15, uTime * 0.1));
-      float grain = vnoise(p * 6.0 + vec2(uTime * 0.9, uTime * 0.4));
-      float thr = 0.28 * streak + 0.45 * lump + 0.2 * grain;
-      float act = smoothstep(0.0, 0.18, f.r * 1.15 - thr);
+      // Fresh whitewater is streaked along the flow; as it ages it breaks into
+      // round patches, then specks (streaks through old foam read as a comb).
+      float fresh = smoothstep(0.3, 0.85, f.r);
+      float streak = gfbm(vec2(q.x * 0.3 - uTime * 0.5, q.y * 0.65));
+      float blot = gfbm(p * 0.5 + vec2(uTime * 0.12, -uTime * 0.08));
+      float lump = 0.6 * gfbm(p * 1.1 + vec2(uTime * 0.3, -uTime * 0.2)) + 0.4 * gfbm(p * 0.4 + vec2(-uTime * 0.15, uTime * 0.1));
+      float grain = clamp(0.5 + 1.2 * gnoise(p * 6.0 + vec2(uTime * 0.9, uTime * 0.4)), 0.0, 1.0);
+      float thr = 0.28 * mix(blot, streak, fresh) + 0.45 * lump + 0.2 * grain;
+      float act = smoothstep(0.0, 0.2, f.r * 1.15 - thr);
       // The roller: dense, tumbling, bright.
       float roller = smoothstep(0.1, 0.5, f.a * 1.3 - 0.35 * lump - 0.25 * grain);
       act = max(act, roller);
-      float tex = fbm2(p * 0.55 + vec2(0.0, uTime * 0.25)) * 0.7 + 0.3 * fbm2(p * 2.1 - uTime * 0.3);
+      float tex = gfbm(p * 0.55 + vec2(0.0, uTime * 0.25)) * 0.7 + 0.3 * gfbm(p * 2.1 - uTime * 0.3);
       float lace = smoothstep(0.66, 0.9, tex * 1.1 + 0.3 * f.g) * smoothstep(0.02, 0.45, f.g);
       float shore = smoothstep(0.3, 0.0, col_h) * 0.6 * smoothstep(0.35, 0.65, fbm2(p * 0.25 + uTime * 0.2));
       float foam = clamp(max(act, max(lace * 0.85, shore)), 0.0, 1.0);

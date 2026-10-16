@@ -148,9 +148,10 @@ export function createLipModel(lay, userOpts = {}) {
     e.x = x; e.y = y; e.z = z; e.vx = vx; e.vy = vy; e.vz = vz; e.spread = spread; e.rate = rate; e.size = size; e.life = life;
     emitters.push(e);
   }
-  function pushTube(x, y, dx, dy, a0, a1, hw, eta, s, H, hold) {
+  function pushTube(x, y, dx, dy, a0, a1, hw, eta, s, H, hold, h0, h1) {
     const tb = tubePool.length ? tubePool.pop() : {};
-    tb.x = x; tb.y = y; tb.dx = dx; tb.dy = dy; tb.a0 = a0; tb.a1 = a1; tb.hw = hw; tb.eta = eta; tb.s = s; tb.H = H; tb.hold = hold;
+    tb.x = x; tb.y = y; tb.dx = dx; tb.dy = dy; tb.a0 = a0; tb.a1 = a1; tb.hw = hw; tb.eta = eta; tb.s = s; tb.H = H;
+    tb.hold = hold; tb.h0 = h0; tb.h1 = h1;
     tubes.push(tb);
   }
 
@@ -364,8 +365,10 @@ export function createLipModel(lay, userOpts = {}) {
       if (phase < 3 && b.alpha[i] > 0 && b.slotLip[i] !== -2) { // -2: the mesh pool had no loop for this sample, so no roofless trench
         const a0 = o.tubeBack * w, a1 = clamp(Math.max(w + 0.5 * H, 1.25 * b.face[i] + dxs), w + 0.5 * H, 4 * H + dxs);
         const eT = 0.3 + 0.7 * b.taper[i]; // the void closes with the ribbon at the ends (same factor as the curtain's throw)
-        // hold: while the lip is in the air the face under it stays green (the renderer holds the whitewater back until the impact)
-        pushTube(b.x[i], b.zRoot[i], b.dirX[i], b.dirZ[i], a0, a0 + (a1 - a0) * eT, hw, b.etaT[i], clamp(s / o.tubeRamp, 0, 1) * b.alpha[i] * b.taper[i], H, phase === 0 ? 1 : 0);
+        // hold: while the lip is in the air the face under it stays green (the renderer holds the whitewater back until
+        // the impact) over the whole breaking band of this sample, from behind the crest to past the landing point
+        pushTube(b.x[i], b.zRoot[i], b.dirX[i], b.dirZ[i], a0, a0 + (a1 - a0) * eT, hw, b.etaT[i], clamp(s / o.tubeRamp, 0, 1) * b.alpha[i] * b.taper[i], H,
+          phase === 0 ? 1 : 0, a0 - 2 * dxs, a1 + 2 * dxs);
       }
       // spray emitters (rates per metre of crest, scaled by the sample spacing)
       if (orphanFade > 0.2 && b.taper[i] > 0.2) {
